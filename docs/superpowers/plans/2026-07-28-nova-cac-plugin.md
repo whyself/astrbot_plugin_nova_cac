@@ -4,7 +4,7 @@
 
 **Goal:** Build and publish an AstrBot plugin that answers NOVA questions through `/cac`, always applies the four-file knowledge-pack foundation, retrieves relevant local material, and preserves recent chat context.
 
-**Architecture:** Keep AstrBot-specific event handling in `main.py` and framework-independent behavior in the `nova_cac` package. `PackLoader` rereads `AGENTS.md`, `soul.md`, `spirit.md`, and `voice.md` for every answer; `KnowledgeIndex` supplies only the highest-scoring Markdown sections; `ConversationMemory` maintains bounded per-session turns. The plugin accepts private `/cac` commands and group `/cac` commands only when the bot is explicitly mentioned.
+**Architecture:** Keep AstrBot-specific event handling in `main.py` and framework-independent behavior in the `nova_cac` package. `PackLoader` rereads `AGENTS.md`, `soul.md`, `spirit.md`, and `voice.md` for every answer; `KnowledgeIndex` supplies only the highest-scoring Markdown sections; `ConversationMemory` maintains bounded per-session turns. The plugin accepts the same literal `/cac` command in private and group chats.
 
 **Tech Stack:** Python 3.10+, AstrBot plugin API, standard-library Markdown parsing and retrieval, `unittest`, Ruff.
 
@@ -107,7 +107,7 @@ Expected: all tests pass.
 
 - [ ] **Step 1: Register the command**
 
-Use `@register` with a regex filter that can match AstrBot's preprocessed command text, then validate the original plain message chain with the strict `/cac` parser. Private messages are accepted directly. Group messages silently stop unless the original command is `/cac` and the message chain includes an `At` component matching `event.get_self_id()`.
+Use `@register` with a regex filter that can match AstrBot's preprocessed command text, then validate the original plain message chain with the strict `/cac` parser. Private and group messages use the same command and do not require an `At` component.
 
 - [ ] **Step 2: Add command handling**
 

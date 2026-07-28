@@ -12,7 +12,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
 from .nova_cac.core import ConversationMemory, KnowledgeIndex, PackLoader
-from .nova_cac.routing import command_allowed, extract_cac_query
+from .nova_cac.routing import extract_cac_query
 
 
 @register(
@@ -65,7 +65,7 @@ class NovaCacPlugin(Star):
 
     @filter.regex(r"^/?cac(?:\s+.*)?$")
     async def cac(self, event: AstrMessageEvent):
-        """Answer a NOVA question in private chat or an explicitly mentioned group."""
+        """Answer a `/cac` NOVA question in either private or group chat."""
 
         raw_text = self._raw_plain_text(event)
         query = extract_cac_query(raw_text)
@@ -73,15 +73,6 @@ class NovaCacPlugin(Star):
             # The regex also sees AstrBot's wake-prefix-stripped `cac ...` form.
             # If the original message had no literal slash, leave it to the
             # normal AstrBot pipeline and never touch this plugin's history.
-            return
-
-        is_private = bool(event.is_private_chat())
-        mentioned = self._is_bot_mentioned(event)
-        if not command_allowed(
-            is_private=is_private,
-            bot_mentioned=mentioned,
-        ):
-            self._stop_event(event)
             return
 
         self._stop_event(event)
@@ -187,19 +178,6 @@ class NovaCacPlugin(Star):
         return str(getattr(event.message_obj, "message_str", "") or "").strip()
 
     @staticmethod
-    def _is_bot_mentioned(event: AstrMessageEvent) -> bool:
-        try:
-            from astrbot.api import message_components as comp
-
-            return any(
-                isinstance(component, comp.At)
-                and str(component.qq) == str(event.get_self_id())
-                for component in event.message_obj.message
-            )
-        except (AttributeError, ImportError):
-            return False
-
-    @staticmethod
     def _session_key(event: AstrMessageEvent) -> str:
         origin = getattr(event, "unified_msg_origin", None)
         if origin:
@@ -219,8 +197,7 @@ class NovaCacPlugin(Star):
     def _help_text() -> str:
         return (
             "用法：\n"
-            "私聊：/cac <问题>\n"
-            "群聊：@机器人 /cac <问题>\n"
+            "群聊或私聊：/cac <问题>\n"
             "/cac reset：清空当前会话的近期上下文\n"
             "/cac help：查看用法"
         )
