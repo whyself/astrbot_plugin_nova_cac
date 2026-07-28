@@ -69,9 +69,15 @@ class NovaCacPlugin(Star):
 
         raw_text = self._raw_plain_text(event)
         query = extract_cac_query(raw_text)
+        if query is None:
+            # The regex also sees AstrBot's wake-prefix-stripped `cac ...` form.
+            # If the original message had no literal slash, leave it to the
+            # normal AstrBot pipeline and never touch this plugin's history.
+            return
+
         is_private = bool(event.is_private_chat())
         mentioned = self._is_bot_mentioned(event)
-        if query is None or not command_allowed(
+        if not command_allowed(
             is_private=is_private,
             bot_mentioned=mentioned,
         ):
