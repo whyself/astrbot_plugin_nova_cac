@@ -1,0 +1,27 @@
+{
+  "history_turns": {
+    "description": "每个会话保留的问答轮数；重启 AstrBot 后清空",
+    "type": "int",
+    "default": 6
+  },
+  "max_sessions": {
+    "description": "最多保留上下文的会话数，超出后淘汰最久未使用的会话",
+    "type": "int",
+    "default": 256
+  },
+  "history_max_chars": {
+    "description": "每个会话近期上下文的总字符上限，与 history_turns 同时生效",
+    "type": "int",
+    "default": 12000
+  },
+  "retrieval_top_k": {
+    "description": "每次最多送给模型的知识片段数",
+    "type": "int",
+    "default": 5
+  },
+  "max_context_chars": {
+    "description": "检索知识片段的总字符上限，不包含四个必读文件",
+    "type": "int",
+    "default": 9000
+  }
+}
