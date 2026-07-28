@@ -107,7 +107,7 @@ Expected: all tests pass.
 
 - [ ] **Step 1: Register the command**
 
-Use `@register` and `@filter.command("cac")`. Private messages are accepted directly. Group messages silently stop unless the message chain includes an `At` component matching `event.get_self_id()`.
+Use `@register` with a regex filter that can match AstrBot's preprocessed command text, then validate the original plain message chain with the strict `/cac` parser. Private messages are accepted directly. Group messages silently stop unless the original command is `/cac` and the message chain includes an `At` component matching `event.get_self_id()`.
 
 - [ ] **Step 2: Add command handling**
 
@@ -121,7 +121,7 @@ Implement:
 
 - [ ] **Step 3: Call the active AstrBot provider**
 
-Resolve the provider through `get_current_chat_provider_id`, pass recent turns as `contexts`, pass the freshly assembled four-file prompt as `system_prompt`, and append the successful question/answer pair to memory.
+Resolve the provider through `get_current_chat_provider_id`, pass recent turns as `contexts`, pass the freshly assembled four-file prompt as `system_prompt`, and append the successful question/answer pair to memory. Serialize reset, context reads, generation, and history writes with a per-session async lock.
 
 - [ ] **Step 4: Handle failures without leaking internals**
 

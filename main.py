@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import re
+import weakref
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +12,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
 from .nova_cac.core import ConversationMemory, KnowledgeIndex, PackLoader
-from .nova_cac.routing import command_allowed
+from .nova_cac.routing import command_allowed, extract_cac_query
 
 
 @register(
@@ -59,19 +59,26 @@ class NovaCacPlugin(Star):
             minimum=1000,
             maximum=30000,
         )
+        self._session_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+            weakref.WeakValueDictionary()
+        )
 
-    @filter.command("cac")
-    async def cac(self, event: AstrMessageEvent, question: str = ""):
+    @filter.regex(r"^/?cac(?:\s+.*)?$")
+    async def cac(self, event: AstrMessageEvent):
         """Answer a NOVA question in private chat or an explicitly mentioned group."""
 
+        raw_text = self._raw_plain_text(event)
+        query = extract_cac_query(raw_text)
         is_private = bool(event.is_private_chat())
         mentioned = self._is_bot_mentioned(event)
-        if not command_allowed(is_private=is_private, bot_mentioned=mentioned):
+        if query is None or not command_allowed(
+            is_private=is_private,
+            bot_mentioned=mentioned,
+        ):
             self._stop_event(event)
             return
 
         self._stop_event(event)
-        query = self._parse_question(event, question)
         command = query.casefold()
         session_key = self._session_key(event)
 
@@ -79,43 +86,45 @@ class NovaCacPlugin(Star):
             yield event.plain_result(self._help_text())
             return
         if command in {"reset", "clear", "清空", "重置"}:
-            cleared = self.memory.clear(session_key)
+            async with self._session_lock(session_key):
+                cleared = self.memory.clear(session_key)
             message = "这段对话的 /cac 上下文已清空。" if cleared else "这段对话目前没有已保存的 /cac 上下文。"
             yield event.plain_result(message)
             return
 
-        try:
-            provider_id = await self.context.get_current_chat_provider_id(
-                event.unified_msg_origin
-            )
-            if not provider_id:
-                yield event.plain_result("当前没有可用的聊天模型，请先在 AstrBot 中配置提供商。")
-                return
+        async with self._session_lock(session_key):
+            try:
+                provider_id = await self.context.get_current_chat_provider_id(
+                    event.unified_msg_origin
+                )
+                if not provider_id:
+                    yield event.plain_result("当前没有可用的聊天模型，请先在 AstrBot 中配置提供商。")
+                    return
 
-            system_prompt, user_prompt = await asyncio.to_thread(
-                self._prepare_prompts,
-                query,
-            )
-            response = await self.context.llm_generate(
-                chat_provider_id=provider_id,
-                prompt=user_prompt,
-                system_prompt=system_prompt,
-                contexts=self.memory.contexts(session_key),
-            )
-            answer = str(getattr(response, "completion_text", "") or "").strip()
-            if not answer:
-                logger.warning("NOVA CAC provider returned an empty response")
-                yield event.plain_result("这次模型没有生成有效回答，可以换个说法再问一次。")
-                return
+                system_prompt, user_prompt = await asyncio.to_thread(
+                    self._prepare_prompts,
+                    query,
+                )
+                response = await self.context.llm_generate(
+                    chat_provider_id=provider_id,
+                    prompt=user_prompt,
+                    system_prompt=system_prompt,
+                    contexts=self.memory.contexts(session_key),
+                )
+                answer = str(getattr(response, "completion_text", "") or "").strip()
+                if not answer:
+                    logger.warning("NOVA CAC provider returned an empty response")
+                    yield event.plain_result("这次模型没有生成有效回答，可以换个说法再问一次。")
+                    return
 
-            self.memory.append_exchange(session_key, query, answer)
-            yield event.plain_result(answer)
-        except FileNotFoundError:
-            logger.exception("NOVA CAC mandatory knowledge-pack file is missing")
-            yield event.plain_result("知识包不完整，暂时无法回答。请联系管理员检查插件文件。")
-        except Exception:
-            logger.exception("NOVA CAC answer generation failed")
-            yield event.plain_result("这次回答没有生成成功，请稍后再试。")
+                self.memory.append_exchange(session_key, query, answer)
+                yield event.plain_result(answer)
+            except FileNotFoundError:
+                logger.exception("NOVA CAC mandatory knowledge-pack file is missing")
+                yield event.plain_result("知识包不完整，暂时无法回答。请联系管理员检查插件文件。")
+            except Exception:
+                logger.exception("NOVA CAC answer generation failed")
+                yield event.plain_result("这次回答没有生成成功，请稍后再试。")
 
     def _prepare_prompts(self, question: str) -> tuple[str, str]:
         # build_system_prompt intentionally rereads all four files on every call.
@@ -148,17 +157,28 @@ class NovaCacPlugin(Star):
             value = default
         return min(maximum, max(minimum, value))
 
+    def _session_lock(self, session_key: str) -> asyncio.Lock:
+        lock = self._session_locks.get(session_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._session_locks[session_key] = lock
+        return lock
+
     @staticmethod
-    def _parse_question(event: AstrMessageEvent, fallback: str) -> str:
-        text = str(getattr(event, "message_str", "") or "").strip()
-        matched = re.search(
-            r"(?:^|\s)/?cac(?:\s+(.*))?\s*$",
-            text,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-        if matched is not None:
-            return (matched.group(1) or "").strip()
-        return fallback.strip()
+    def _raw_plain_text(event: AstrMessageEvent) -> str:
+        try:
+            from astrbot.api import message_components as comp
+
+            text = "".join(
+                component.text
+                for component in event.message_obj.message
+                if isinstance(component, comp.Plain)
+            ).strip()
+            if text:
+                return text
+        except (AttributeError, ImportError):
+            pass
+        return str(getattr(event.message_obj, "message_str", "") or "").strip()
 
     @staticmethod
     def _is_bot_mentioned(event: AstrMessageEvent) -> bool:

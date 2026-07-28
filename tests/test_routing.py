@@ -10,6 +10,7 @@ class RoutingTests(unittest.TestCase):
         self.assertTrue(command_allowed(is_private=True, bot_mentioned=False))
         self.assertEqual("NOVA 是什么？", extract_cac_query("/cac NOVA 是什么？"))
         self.assertIsNone(extract_cac_query("NOVA 是什么？"))
+        self.assertIsNone(extract_cac_query("cac NOVA 是什么？"))
         self.assertIsNone(extract_cac_query("/cache hello"))
 
     def test_group_requires_cac_command_and_bot_mention(self) -> None:
