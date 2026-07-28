@@ -2,6 +2,10 @@
 
 一个供 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 使用的 NOVA 问答插件。它把当前仓库内的 `knowledge_pack` 作为回答依据，按 CAC 文档中呈现的思考方式和语言风格组织回答，同时保留近期 `/cac` 对话上下文。
 
+## 内容包架构
+
+`knowledge_pack` 是一套与具体机器人框架解耦的 NOVA 内容包：`AGENTS.md` 规定回答流程、资料路由和事实边界，`soul.md`、`spirit.md`、`voice.md` 分别定义回应姿态、社团理念和 CAC 的表达方式，并在每次回答前完整读取；`knowledge/` 则按“认识 NOVA、理念与方法、规章与活动”保存经过筛选的原始文章，回答时只读取相关内容。它把事实依据、理念解释、人格姿态和说话方式分开维护，因此也可以复用于其他插件、Skill 或 Agent。
+
 ## 唤起方式
 
 私聊直接发送：
