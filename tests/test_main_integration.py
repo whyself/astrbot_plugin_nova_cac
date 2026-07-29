@@ -232,6 +232,7 @@ class MainIntegrationTests(unittest.TestCase):
             output = asyncio.run(
                 _collect(plugin.cac(FakeEvent("/cac NOVA 是什么？")))
             )
+            asyncio.run(plugin.terminate())
 
             self.assertEqual(output, ["NOVA 更看重主动探索和真实行动。"])
             self.assertEqual(len(calls), 1)
@@ -243,8 +244,11 @@ class MainIntegrationTests(unittest.TestCase):
             self.assertTrue(all(tool_rounds))
             for filename in ("AGENTS.md", "soul.md", "spirit.md", "voice.md"):
                 self.assertIn(f"# 文件：{filename}", call["system_prompt"])
-            self.assertIn("连续多轮使用工具", call["system_prompt"])
-            asyncio.run(plugin.terminate())
+            compact_prompt = "".join(call["system_prompt"].split())
+            self.assertIn("连续多轮使用工具", compact_prompt)
+            self.assertIn("简单问题默认不分标题", compact_prompt)
+            self.assertIn("非必要不用列表", compact_prompt)
+            self.assertIn("能用两三段说清楚就及时收住", compact_prompt)
 
 if __name__ == "__main__":
     unittest.main()

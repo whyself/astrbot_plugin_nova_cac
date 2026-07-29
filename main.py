@@ -44,7 +44,7 @@ from .nova_cac.vector_index import ChunkVectorIndex
     "astrbot_plugin_nova_cac",
     "whyself",
     "基于本地 NOVA 知识包与近期上下文的 CAC 风格问答",
-    "0.3.2",
+    "0.3.3",
 )
 class NovaCacPlugin(Star):
     """Explicitly triggered `/cac` knowledge Q&A."""
