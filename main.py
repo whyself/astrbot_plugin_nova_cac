@@ -14,9 +14,7 @@ from astrbot.api.star import Context, Star, StarTools, register
 
 from .nova_cac.agent import (
     AGENT_ERROR,
-    NO_EVIDENCE,
     NO_PROVIDER,
-    SAFE_FAILURE,
     NovaCacAgent,
 )
 from .nova_cac.chunk_store import ChunkStore
@@ -47,7 +45,7 @@ from .nova_cac.vector_index import ChunkVectorIndex
     "astrbot_plugin_nova_cac",
     "whyself",
     "基于本地 NOVA 知识包与近期上下文的 CAC 风格问答",
-    "0.3.0",
+    "0.3.1",
 )
 class NovaCacPlugin(Star):
     """Explicitly triggered `/cac` knowledge Q&A."""
@@ -202,12 +200,7 @@ class NovaCacPlugin(Star):
                     yield event.plain_result(AGENT_ERROR)
                     return
 
-                if answer not in {
-                    AGENT_ERROR,
-                    NO_EVIDENCE,
-                    NO_PROVIDER,
-                    SAFE_FAILURE,
-                }:
+                if answer not in {AGENT_ERROR, NO_PROVIDER}:
                     self.memory.append_exchange(session_key, query, answer)
                 yield event.plain_result(answer)
             except FileNotFoundError:

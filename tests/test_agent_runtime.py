@@ -10,6 +10,7 @@ from pathlib import Path
 from nju_qa.agent import (
     NO_EVIDENCE,
     NjuQaAgent,
+    NovaCacAgent,
     SourceTracker,
     _MAX_RESEARCH_STEPS,
     _is_small_talk,
@@ -212,31 +213,45 @@ def test_diagnostics_logs_evidence_summary(caplog, tmp_path: Path):
     assert "校园卡可在服务中心补办" not in logs
 
 
-def test_nova_pack_and_cac_context_reach_both_agent_phases(tmp_path: Path):
+def test_nova_pack_and_cac_context_reach_direct_agent_with_tools():
     calls = []
 
     async def loop(**kwargs):
         calls.append(kwargs)
-        if "研究" in kwargs.get("system_prompt", ""):
-            return Response("research")
-        return Response("NOVA 的事实 [E1]")
+        return Response("这是一段自然回答。")
 
-    agent = NjuQaAgent(Context(), lambda tracker: [], loop)
-    tracker = SourceTracker()
-    tracker.add_read_document(_make_doc(tmp_path), "NOVA 的事实")
+    tool = object()
+    agent = NovaCacAgent(Context(), lambda tracker: [tool], loop)
     contexts = [{"role": "user", "content": "上一轮 /cac 问题"}]
     answer = asyncio.run(
         agent.answer(
             Event(),
             "那这个呢？",
-            tracker=tracker,
             base_system_prompt="AGENTS\nSOUL\nSPIRIT\nVOICE",
             contexts=contexts,
             include_sources=False,
         )
     )
 
-    assert len(calls) == 2
-    assert all("AGENTS\nSOUL\nSPIRIT\nVOICE" in call["system_prompt"] for call in calls)
-    assert all(call["contexts"] == contexts for call in calls)
-    assert "参考来源" not in answer
+    assert len(calls) == 1
+    assert "AGENTS\nSOUL\nSPIRIT\nVOICE" in calls[0]["system_prompt"]
+    assert calls[0]["contexts"] == contexts
+    assert calls[0]["tools"] == [tool]
+    assert answer == "这是一段自然回答。"
+
+
+def test_nova_direct_agent_does_not_force_no_evidence_response():
+    async def loop(**_kwargs):
+        return Response("这个问题可以先从你的实际目标说起。")
+
+    agent = NovaCacAgent(Context(), lambda tracker: [], loop)
+    answer = asyncio.run(
+        agent.answer(
+            Event(),
+            "我应该参加 NOVA 吗？",
+            base_system_prompt="PACK",
+            include_sources=False,
+        )
+    )
+    assert answer == "这个问题可以先从你的实际目标说起。"
+    assert answer != NO_EVIDENCE

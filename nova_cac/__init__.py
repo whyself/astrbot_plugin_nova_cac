@@ -1,4 +1,4 @@
-"""NOVA CAC Pack adapter around the ported NJU evidence-first Agent."""
+"""NOVA CAC Pack adapter using the ported NJU retrieval subsystem."""
 
 from .agent import NovaCacAgent
 from .core import ConversationMemory, PackLoader

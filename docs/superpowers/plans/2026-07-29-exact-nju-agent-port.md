@@ -1,5 +1,10 @@
 # Exact NJU Agent Port Implementation Plan
 
+> Corrected in `v0.3.1`: only the retrieval/index/tool subsystem is used by
+> `/cac`. The strict two-stage evidence gate remains as an internal upstream
+> compatibility implementation, while the production `NovaCacAgent` performs
+> one normal AstrBot Agent call and answers directly.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Replace the simplified NOVA Agent implementation with a source-level port of `Gu-Heping/astrbot_plugin_nju_qa` commit `275d8b8d17aa86615fbb39f4a23291d32bed3643`.

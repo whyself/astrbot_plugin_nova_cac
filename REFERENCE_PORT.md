@@ -19,9 +19,13 @@ Intentional adapter changes:
    chunk interfaces consumed by the upstream Agent.
 3. The public AstrBot adapter retains literal `/cac`, Pack-mandatory reads,
    `/cac`-only bounded history, help/reset, and per-session serialization.
-4. The Pack prompt and recent `/cac` contexts are passed into both upstream
-   Agent phases.
-5. Source lists remain hidden unless the current user explicitly asks for
+4. The upstream strict two-stage class remains available for component parity,
+   but `/cac` uses `NovaCacAgent`, a single-pass AstrBot Agent wrapper around
+   the same retrieval tools. It does not require evidence markers or force the
+   upstream no-evidence sentence.
+5. The freshly read Pack prompt and recent `/cac` contexts are passed into that
+   direct Agent call.
+6. Source lists remain hidden unless the current user explicitly asks for
    来源、出处、原文或链接.
 
 The upstream test modules for Agent runtime, chunking, hybrid retrieval,

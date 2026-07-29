@@ -31,8 +31,8 @@ AstrBot 不会因为模型“觉得自己忘了”就自动发现或读取插件
 2. 重新读取 `knowledge_pack/soul.md`；
 3. 重新读取 `knowledge_pack/spirit.md`；
 4. 重新读取 `knowledge_pack/voice.md`；
-5. 让研究 Agent 根据问题自行选择混合检索、关键词搜索、文章列表、目录和原文读取工具；
-6. 只把研究阶段实际读过的原文证据交给无工具的回答阶段，再结合近期 `/cac` 对话和当前问题生成回答。
+5. 把四个文件和近期 `/cac` 对话一起交给 AstrBot Agent；
+6. Agent 根据问题自行选择混合检索、关键词搜索、文章列表、目录或原文读取工具，然后直接生成自然回答。
 
 因此，四个核心文件在运行中被修改后，下一次回答就会使用新内容，不需要重启插件。普通知识文章会建立本地 SQLite、BM25 和 Chroma 索引，文件发生变化时自动刷新。
 
@@ -54,15 +54,15 @@ git clone https://github.com/whyself/astrbot_plugin_nova_cac.git
 
 ## Agent 检索流程
 
-回答分为两个阶段。研究阶段拥有以下本地工具，并由模型按问题自行决定调用顺序：
+插件只替换 Agent 的本地文档检索能力，不改变正常回答方式。一次 Agent 调用中可以使用以下工具，并由模型按问题自行决定是否调用以及调用顺序：
 
 - `search_knowledge_base`：融合 Chroma 向量相似度与 BM25 关键词得分，返回候选片段；
 - `grep_local_docs`：按明确的名称、日期、条款或关键词定位 Markdown 行；
-- `read_doc`：读取指定文章的准确行段，并把它登记为可用于回答的证据。
+- `read_doc`：读取指定文章的准确行段；
 - `search_docs`、`get_doc_details`、`parse_yuque_url`：按文档元数据、路径或原始语雀链接定位资料；
 - `list_knowledge_bases`、`list_repo_docs`、`list_repo_tree`、`get_doc_outline`、`doc_stats`：浏览完整知识结构和索引状态。
 
-搜索结果只是候选，不能直接进入最终回答。研究 Agent 必须再用 `read_doc` 读到正文；随后回答阶段关闭全部工具，只接收已登记的原文证据。内部证据标记在输出前会校验并移除。用户没有主动问“来源、出处、原文、链接”时，最终回答仍保持自然口语，不展示检索报告或引用列表。
+Agent 可以先搜索候选片段，也可以继续用 `read_doc` 核对原文，但不会再进入独立的证据门控回答阶段，也不要求输出 `[E#]` 标记。即使没有检索到严格证据，也由 Agent 按内容包中的事实边界自然回应，不套用固定拒答句。用户没有主动问“来源、出处、原文、链接”时，最终回答保持自然口语，不展示检索报告或引用列表。
 
 ## 配置
 
@@ -123,7 +123,7 @@ python -m compileall -q main.py nova_cac tests
 ruff check .
 ```
 
-实现使用 AstrBot 官方插件接口和 [Soulter/helloworld](https://github.com/Soulter/helloworld) 模板，并以源码级方式移植 [Gu-Heping/astrbot_plugin_nju_qa](https://github.com/Gu-Heping/astrbot_plugin_nju_qa) 提交 `275d8b8d` 的两阶段 Agent、证据系统、混合检索、文档索引和完整研究工具；唯一的数据源替换是把远程语雀同步改成本仓库的 Markdown 内容包。完整移植清单和保留的 NOVA 适配边界见 [`REFERENCE_PORT.md`](REFERENCE_PORT.md)。
+实现使用 AstrBot 官方插件接口和 [Soulter/helloworld](https://github.com/Soulter/helloworld) 模板，并以源码级方式移植 [Gu-Heping/astrbot_plugin_nju_qa](https://github.com/Gu-Heping/astrbot_plugin_nju_qa) 提交 `275d8b8d` 的混合检索、文档索引和完整工具系统。上游两阶段证据实现保留在内部以维持检索组件兼容，但实际 `/cac` 使用单次 AstrBot Agent 调用直接回答；远程语雀同步则替换为本仓库的 Markdown 内容包。完整清单见 [`REFERENCE_PORT.md`](REFERENCE_PORT.md)。
 
 ## 许可证
 

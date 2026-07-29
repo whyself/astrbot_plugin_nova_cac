@@ -187,7 +187,7 @@ class MainIntegrationTests(unittest.TestCase):
 
             async def failed_answer(_event, _query, **_kwargs):
                 module = sys.modules["_nova_cac_plugin_test.main"]
-                return module.SAFE_FAILURE
+                return module.AGENT_ERROR
 
             plugin.agent.answer = failed_answer
             asyncio.run(_collect(plugin.cac(FakeEvent("/cac 无证据问题"))))
