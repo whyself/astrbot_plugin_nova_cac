@@ -445,7 +445,11 @@ class HybridRetriever:
             "selected": search_results,
             "threshold": threshold,
             "chunk_count": self.chunk_store.chunk_count() if self.chunk_store else 0,
-            "vector_count": self.vector_index.count() if self.vector_index else 0,
+            "vector_count": (
+                self.vector_index.count()
+                if self.vector_index and self.config.enable_vector_search
+                else 0
+            ),
             "last_error": self._last_error,
             "scope": scope,
         }

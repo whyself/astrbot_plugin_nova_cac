@@ -25,8 +25,8 @@ Intentional adapter changes:
    upstream no-evidence sentence.
 5. The freshly read Pack prompt and recent `/cac` contexts are passed into that
    direct Agent call.
-6. Source lists remain hidden unless the current user explicitly asks for
-   来源、出处、原文或链接.
+6. Titles, document paths, source URLs, and citation markers stay internal;
+   the final `/cac` answer never appends a source section.
 
 The upstream test modules for Agent runtime, chunking, hybrid retrieval,
 document tools, evidence/version handling, scoped retrieval, and structure

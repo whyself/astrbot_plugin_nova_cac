@@ -87,6 +87,15 @@ def _strip_unverified_urls(text: str, allowed_urls: set[str]) -> str:
     return re.sub(r"https?://[^\s<>()，。；：）]+", replace, text)
 
 
+def _strip_source_appendix(text: str) -> str:
+    """Remove a trailing source section from the user-visible direct answer."""
+    return re.sub(
+        r"(?ms)\n+(?:#{1,6}\s*)?(?:参考来源|来源|出处|参考资料)\s*[：:].*$",
+        "",
+        text,
+    ).strip()
+
+
 def _evidence_content_key(content: str) -> str:
     """Return a normalized form of evidence content for deduplication."""
     lines = content.splitlines()
@@ -767,14 +776,15 @@ class NjuQaAgent:
 _DIRECT_ANSWER_SYSTEM_PROMPT = """你是 NOVA CAC 内容包问答助手。
 
 请直接回答用户，不要执行“研究阶段—证据阶段—回答阶段”的内部证据门控，也不要要求
-输出 [E#] 标记。你可以根据问题自行决定是否调用本地知识库工具，以及使用向量检索、
-关键词搜索、目录浏览或原文读取中的哪一种；工具只是帮助你寻找资料，不要向用户汇报
-检索过程。
+输出 [E#] 标记。你可以根据问题自行决定是否调用本地知识库工具。在同一次 Agent 调用
+中可以连续多轮使用工具：先用向量与关键词混合检索寻找候选，结果不足时改写查询或使用
+grep 缩小范围，再按需浏览目录、读取原文；资料足够后直接形成最终回答。工具只是帮助你
+寻找资料，不要向用户汇报检索过程。
 
 涉及 NOVA 的事实、制度、活动或理念时，应优先使用工具核对本地文档；资料没有明确写出
 答案时，按照内容包中的事实边界自然说明不确定之处，不要套用固定拒答句。普通交流可以
-直接回应，不需要为了调用工具而调用工具。默认自然、口语化回答；只有用户明确索要来源
-时才简洁给出相关文档标题或原文链接。"""
+直接回应，不需要为了调用工具而调用工具。最终回答必须自然、口语化，不附参考来源、
+文档路径、原文链接或引用编号。"""
 
 
 class NovaCacAgent(NjuQaAgent):
@@ -788,7 +798,7 @@ class NovaCacAgent(NjuQaAgent):
         *,
         base_system_prompt: str = "",
         contexts: list[dict[str, str]] | None = None,
-        include_sources: bool = True,
+        include_sources: bool = False,
     ) -> str:
         provider_id = await self.context.get_current_chat_provider_id(
             getattr(event, "unified_msg_origin")
@@ -798,19 +808,13 @@ class NovaCacAgent(NjuQaAgent):
 
         tracker = tracker or SourceTracker()
         tracker.diagnostics = self.diagnostics
-        source_rule = (
-            "用户明确索要了来源，可以在正文后简洁给出相关文档标题或原文链接。"
-            if include_sources
-            else "用户没有索要来源，不要输出来源列表、文档路径或链接。"
-        )
         try:
             response = await self._run_tool_loop(
                 event=event,
                 chat_provider_id=provider_id,
                 prompt=prompt,
                 system_prompt=(
-                    f"{base_system_prompt}\n\n{_DIRECT_ANSWER_SYSTEM_PROMPT}\n\n"
-                    f"{source_rule}"
+                    f"{base_system_prompt}\n\n{_DIRECT_ANSWER_SYSTEM_PROMPT}"
                 ),
                 contexts=contexts or [],
                 tracker=tracker,
@@ -823,6 +827,5 @@ class NovaCacAgent(NjuQaAgent):
         text = str(getattr(response, "completion_text", "") or "").strip()
         if not text:
             return AGENT_ERROR
-        if not include_sources:
-            text = _strip_unverified_urls(text, set())
-        return text
+        text = _strip_unverified_urls(text, set())
+        return _strip_source_appendix(text)

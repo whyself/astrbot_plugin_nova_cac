@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import re
 import weakref
 from pathlib import Path
 from typing import Any
@@ -45,7 +44,7 @@ from .nova_cac.vector_index import ChunkVectorIndex
     "astrbot_plugin_nova_cac",
     "whyself",
     "基于本地 NOVA 知识包与近期上下文的 CAC 风格问答",
-    "0.3.1",
+    "0.3.2",
 )
 class NovaCacPlugin(Star):
     """Explicitly triggered `/cac` knowledge Q&A."""
@@ -194,7 +193,7 @@ class NovaCacPlugin(Star):
                     query,
                     base_system_prompt=system_prompt,
                     contexts=self.memory.contexts(session_key),
-                    include_sources=self._asks_for_sources(query),
+                    include_sources=False,
                 )
                 if not answer:
                     yield event.plain_result(AGENT_ERROR)
@@ -300,49 +299,4 @@ class NovaCacPlugin(Star):
             "群聊或私聊：/cac <问题>\n"
             "/cac reset：清空当前会话的近期上下文\n"
             "/cac help：查看用法"
-        )
-
-    @staticmethod
-    def _asks_for_sources(query: str) -> bool:
-        text = query.casefold().strip()
-        source_terms = (
-            r"来源|出处|原文|参考资料|参考来源|参考文献|"
-            r"资料依据|引用依据|依据|证据"
-        )
-        if re.search(
-            rf"(?:请|麻烦|能否|可以)?"
-            rf"(?:给|给出|提供|发|附|附上|列出|说明|注明|展示|告诉我|找出)"
-            rf".{{0,10}}(?:{source_terms})",
-            text,
-        ):
-            return True
-        if re.search(
-            r"(?:来源|出处|参考资料|参考来源|参考文献|资料依据|引用依据|依据|证据)"
-            r".{0,3}(?:是什么|在哪(?:里)?|哪里|哪儿|呢|吗|有吗|怎么来的|[？?])",
-            text,
-        ):
-            return True
-        if re.fullmatch(
-            rf"(?:{source_terms})(?:是什么|在哪(?:里)?|哪里|呢|吗|有吗)?[？?！!。]?",
-            text,
-        ):
-            return True
-        if re.fullmatch(
-            r"(?:url|source|sources|citation|citations)[?!.]?",
-            text,
-        ):
-            return True
-        if re.search(
-            r"\b(?:give|provide|show|list|cite)\b.{0,30}"
-            r"\b(?:source|sources|citation|citations|url)\b",
-            text,
-        ):
-            return True
-        return bool(
-            re.search(
-                r"(?:给|提供|发|附).{0,5}(?:链接|地址)"
-                r"|(?:原文|文档|文章|资料).{0,5}(?:链接|地址)"
-                r"|^(?:链接|地址)(?:呢|吗|发一下|给我)?[？?！!。]?$",
-                text,
-            )
         )

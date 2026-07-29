@@ -113,6 +113,9 @@ class FakeContext:
     def __init__(self, data_dir: Path):
         self.data_dir = data_dir
 
+    async def get_current_chat_provider_id(self, _origin):
+        return "provider"
+
 
 class FakeEvent:
     def __init__(self, text: str):
@@ -194,29 +197,54 @@ class MainIntegrationTests(unittest.TestCase):
             self.assertEqual(len(plugin.memory.contexts("group:test")), 2)
             asyncio.run(plugin.terminate())
 
-    def test_source_list_requires_explicit_source_intent(self):
-        asks = self.plugin_class._asks_for_sources
-        for query in (
-            "这段话的来源是什么",
-            "给出参考资料",
-            "引用依据呢",
-            "请给出依据",
-            "请给出证据",
-            "URL",
-            "把原文链接发我",
-        ):
-            with self.subTest(query=query):
-                self.assertTrue(asks(query))
+    def test_full_agent_flow_loads_pack_exposes_multistep_tools_and_hides_sources(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sys.modules["astrbot.api.star"].StarTools._data_dir = Path(temp_dir)
+            plugin = self.plugin_class(
+                FakeContext(Path(temp_dir)),
+                {"enable_vector_search": False},
+            )
+            calls = []
+            tool_rounds = []
 
-        for query in (
-            "如何链接 GitHub",
-            "把这两个概念链接起来",
-            "NOVA 文献综述活动是什么？",
-            "如何阅读引用内容",
-            "NOVA 是什么",
-        ):
-            with self.subTest(query=query):
-                self.assertFalse(asks(query))
+            async def loop(**kwargs):
+                calls.append(kwargs)
+                tools = {tool.name: tool for tool in kwargs["tools"]}
+                tool_rounds.append(
+                    await tools["search_knowledge_base"]._search("NOVA")
+                )
+                tool_rounds.append(
+                    await tools["search_knowledge_base"]._search(
+                        "NOVA 技术社团 定位"
+                    )
+                )
+                tool_rounds.append(
+                    await tools["list_knowledge_bases"]._run()
+                )
+                return types.SimpleNamespace(
+                    completion_text=(
+                        "NOVA 更看重主动探索和真实行动。\n\n"
+                        "参考来源：\n《NOVA 介绍》：https://example.test/nova"
+                    )
+                )
+
+            plugin.agent._tool_loop = loop
+            output = asyncio.run(
+                _collect(plugin.cac(FakeEvent("/cac NOVA 是什么？")))
+            )
+
+            self.assertEqual(output, ["NOVA 更看重主动探索和真实行动。"])
+            self.assertEqual(len(calls), 1)
+            call = calls[0]
+            self.assertEqual(call["max_steps"], 12)
+            self.assertEqual(len(call["tools"]), 11)
+            self.assertEqual(call["contexts"], [])
+            self.assertEqual(len(tool_rounds), 3)
+            self.assertTrue(all(tool_rounds))
+            for filename in ("AGENTS.md", "soul.md", "spirit.md", "voice.md"):
+                self.assertIn(f"# 文件：{filename}", call["system_prompt"])
+            self.assertIn("连续多轮使用工具", call["system_prompt"])
+            asyncio.run(plugin.terminate())
 
 if __name__ == "__main__":
     unittest.main()

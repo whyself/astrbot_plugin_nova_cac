@@ -1,7 +1,7 @@
 name: astrbot_plugin_nova_cac
 display_name: NOVA CAC 问答
 desc: 基于本地 NOVA 知识包、混合检索 Agent、CAC 表达风格和会话上下文的问答插件
-version: v0.3.1
+version: v0.3.2
 author: whyself
 repo: https://github.com/whyself/astrbot_plugin_nova_cac
 astrbot_version: ">=4.16,<5"
