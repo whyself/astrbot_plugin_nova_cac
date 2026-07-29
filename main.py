@@ -9,42 +9,17 @@ from typing import Any
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.star import Context, Star, StarTools, register
+from astrbot.api.star import Context, Star, register
 
-from .nova_cac.agent import (
-    AGENT_ERROR,
-    NO_PROVIDER,
-    NovaCacAgent,
-)
-from .nova_cac.chunk_store import ChunkStore
-from .nova_cac.config import PluginConfig
-from .nova_cac.core import ConversationMemory, PackLoader
-from .nova_cac.document_index import DocumentIndex
-from .nova_cac.document_store import DocumentStore
-from .nova_cac.local_sync import LocalPackSync
-from .nova_cac.retriever import HybridRetriever
+from .nova_cac.core import ConversationMemory, KnowledgeIndex, PackLoader
 from .nova_cac.routing import extract_cac_query
-from .nova_cac.tools import (
-    DocStatsTool,
-    GetDocDetailsTool,
-    GetDocOutlineTool,
-    GrepLocalDocsTool,
-    ListKnowledgeBasesTool,
-    ListRepoDocsTool,
-    ListRepoTreeTool,
-    ParseYuqueUrlTool,
-    ReadDocTool,
-    SearchKnowledgeBaseTool,
-    SearchDocsTool,
-)
-from .nova_cac.vector_index import ChunkVectorIndex
 
 
 @register(
     "astrbot_plugin_nova_cac",
     "whyself",
     "基于本地 NOVA 知识包与近期上下文的 CAC 风格问答",
-    "0.3.5",
+    "0.1.0",
 )
 class NovaCacPlugin(Star):
     """Explicitly triggered `/cac` knowledge Q&A."""
@@ -53,10 +28,10 @@ class NovaCacPlugin(Star):
         super().__init__(context)
         self.context = context
         self.config = config or {}
-        self.agent_config = PluginConfig.from_mapping(self.config)
 
         pack_root = Path(__file__).resolve().parent / "knowledge_pack"
         self.pack_loader = PackLoader(pack_root)
+        self.knowledge_index = KnowledgeIndex(pack_root / "knowledge")
         self.memory = ConversationMemory(
             history_turns=self._config_int("history_turns", 6, minimum=0, maximum=20),
             max_sessions=self._config_int(
@@ -72,89 +47,21 @@ class NovaCacPlugin(Star):
                 maximum=50000,
             ),
         )
-        data_dir = StarTools.get_data_dir("astrbot_plugin_nova_cac")
-        self._data_dir = data_dir
-        self.store = DocumentStore(data_dir / "documents")
-        self.index = DocumentIndex(data_dir / "nova_cac.sqlite3")
-        self.chunk_store = ChunkStore(data_dir / "chunks.sqlite3")
-        self.vector_index = ChunkVectorIndex(
-            data_dir / "vectors",
-            self.agent_config.embedding_model,
+        self.retrieval_top_k = self._config_int(
+            "retrieval_top_k",
+            5,
+            minimum=1,
+            maximum=12,
         )
-        self.syncer = LocalPackSync(
-            pack_root / "knowledge",
-            self.store,
-            self.index,
-            self.chunk_store,
-            self.vector_index,
-            self.agent_config,
-            state_path=data_dir / "local_pack_state.json",
-        )
-        self.retriever = HybridRetriever(
-            self.index,
-            self.agent_config,
-            chunk_store=self.chunk_store,
-            vector_index=self.vector_index,
-        )
-        self.agent = NovaCacAgent(
-            self.context,
-            lambda tracker: [
-                SearchKnowledgeBaseTool(retriever=self.retriever, tracker=tracker),
-                GrepLocalDocsTool(
-                    index=self.index, docs_root=self.store.root, tracker=tracker
-                ),
-                ReadDocTool(
-                    index=self.index, docs_root=self.store.root, tracker=tracker
-                ),
-                SearchDocsTool(
-                    index=self.index, docs_root=self.store.root, tracker=tracker
-                ),
-                GetDocDetailsTool(
-                    index=self.index, docs_root=self.store.root, tracker=tracker
-                ),
-                ParseYuqueUrlTool(
-                    index=self.index, docs_root=self.store.root, tracker=tracker
-                ),
-                ListKnowledgeBasesTool(
-                    index=self.index, docs_root=self.store.root, tracker=tracker
-                ),
-                ListRepoDocsTool(
-                    index=self.index, docs_root=self.store.root, tracker=tracker
-                ),
-                ListRepoTreeTool(
-                    index=self.index, docs_root=self.store.root, tracker=tracker
-                ),
-                GetDocOutlineTool(
-                    index=self.index, docs_root=self.store.root, tracker=tracker
-                ),
-                DocStatsTool(
-                    index=self.index, docs_root=self.store.root, tracker=tracker
-                ),
-            ],
-            docs_root=self.store.root,
-            index=self.index,
-            diagnostics=self.agent_config.retrieval_diagnostics,
+        self.max_context_chars = self._config_int(
+            "max_context_chars",
+            9000,
+            minimum=1000,
+            maximum=30000,
         )
         self._session_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
             weakref.WeakValueDictionary()
         )
-
-    async def initialize(self) -> None:
-        result = await self.syncer.refresh()
-        logger.info(
-            "NOVA CAC local corpus: documents=%s chunks=%s rebuilt=%s vector_ready=%s",
-            result.get("documents"),
-            result.get("chunks"),
-            result.get("rebuilt"),
-            result.get("vector_ready"),
-        )
-        if result.get("vector_error"):
-            logger.warning("NOVA CAC vector index fallback: %s", result["vector_error"])
-
-    async def terminate(self) -> None:
-        self.index.close()
-        self.chunk_store.close()
-        self.vector_index.close()
 
     @filter.regex(r"^/?cac(?:\s+.*)?$")
     async def cac(self, event: AstrMessageEvent):
@@ -184,23 +91,30 @@ class NovaCacPlugin(Star):
 
         async with self._session_lock(session_key):
             try:
-                await self.syncer.refresh()
-                system_prompt = await asyncio.to_thread(
-                    self.pack_loader.build_system_prompt
+                provider_id = await self.context.get_current_chat_provider_id(
+                    event.unified_msg_origin
                 )
-                answer = await self.agent.answer(
-                    event,
-                    query,
-                    base_system_prompt=system_prompt,
-                    contexts=self.memory.contexts(session_key),
-                    include_sources=False,
-                )
-                if not answer:
-                    yield event.plain_result(AGENT_ERROR)
+                if not provider_id:
+                    yield event.plain_result("当前没有可用的聊天模型，请先在 AstrBot 中配置提供商。")
                     return
 
-                if answer not in {AGENT_ERROR, NO_PROVIDER}:
-                    self.memory.append_exchange(session_key, query, answer)
+                system_prompt, user_prompt = await asyncio.to_thread(
+                    self._prepare_prompts,
+                    query,
+                )
+                response = await self.context.llm_generate(
+                    chat_provider_id=provider_id,
+                    prompt=user_prompt,
+                    system_prompt=system_prompt,
+                    contexts=self.memory.contexts(session_key),
+                )
+                answer = str(getattr(response, "completion_text", "") or "").strip()
+                if not answer:
+                    logger.warning("NOVA CAC provider returned an empty response")
+                    yield event.plain_result("这次模型没有生成有效回答，可以换个说法再问一次。")
+                    return
+
+                self.memory.append_exchange(session_key, query, answer)
                 yield event.plain_result(answer)
             except FileNotFoundError:
                 logger.exception("NOVA CAC mandatory knowledge-pack file is missing")
@@ -208,6 +122,21 @@ class NovaCacPlugin(Star):
             except Exception:
                 logger.exception("NOVA CAC answer generation failed")
                 yield event.plain_result("这次回答没有生成成功，请稍后再试。")
+
+    def _prepare_prompts(self, question: str) -> tuple[str, str]:
+        # build_system_prompt intentionally rereads all four files on every call.
+        system_prompt = self.pack_loader.build_system_prompt()
+        chunks = self.knowledge_index.search(
+            question,
+            top_k=self.retrieval_top_k,
+            max_chars=self.max_context_chars,
+        )
+        logger.info(
+            "NOVA CAC retrieval selected %d chunks for query length %d",
+            len(chunks),
+            len(question),
+        )
+        return system_prompt, self.pack_loader.build_user_prompt(question, chunks)
 
     def _config_int(
         self,
@@ -224,34 +153,6 @@ class NovaCacPlugin(Star):
         except (TypeError, ValueError):
             value = default
         return min(maximum, max(minimum, value))
-
-    def _config_float(
-        self,
-        key: str,
-        default: float,
-        *,
-        minimum: float,
-        maximum: float,
-    ) -> float:
-        getter = getattr(self.config, "get", None)
-        raw: Any = getter(key, default) if callable(getter) else default
-        try:
-            value = float(raw)
-        except (TypeError, ValueError):
-            value = default
-        return min(maximum, max(minimum, value))
-
-    def _config_bool(self, key: str, default: bool) -> bool:
-        getter = getattr(self.config, "get", None)
-        raw: Any = getter(key, default) if callable(getter) else default
-        if isinstance(raw, str):
-            return raw.casefold() in {"1", "true", "yes", "on"}
-        return bool(raw)
-
-    def _config_str(self, key: str, default: str = "") -> str:
-        getter = getattr(self.config, "get", None)
-        raw: Any = getter(key, default) if callable(getter) else default
-        return str(raw or default).strip()
 
     def _session_lock(self, session_key: str) -> asyncio.Lock:
         lock = self._session_locks.get(session_key)

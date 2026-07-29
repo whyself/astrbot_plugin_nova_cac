@@ -1,14 +1,11 @@
-"""NOVA CAC Pack adapter using the ported NJU retrieval subsystem."""
+"""Framework-independent core for the NOVA CAC AstrBot plugin."""
 
-from .agent import NovaCacAgent
-from .core import ConversationMemory, PackLoader
-from .local_sync import LocalPackSync
-from .retriever import HybridRetriever
+from .core import ConversationMemory, KnowledgeIndex, PackLoader, RetrievedChunk
 
 __all__ = [
     "ConversationMemory",
-    "HybridRetriever",
-    "LocalPackSync",
-    "NovaCacAgent",
+    "KnowledgeIndex",
     "PackLoader",
+    "RetrievedChunk",
 ]
+

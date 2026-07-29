@@ -1,9 +1,8 @@
 __pycache__/
-.pytest_cache/
-tests/_tmp_evidence*/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
 .coverage
 .idea/
 .vscode/
+
