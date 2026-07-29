@@ -96,6 +96,87 @@ def _strip_source_appendix(text: str) -> str:
     ).strip()
 
 
+def _is_simple_query(prompt: str) -> bool:
+    compact = re.sub(r"\s+", "", prompt)
+    detail_markers = (
+        "详细",
+        "完整",
+        "系统",
+        "深入",
+        "全面",
+        "逐条",
+        "对比",
+        "分析",
+        "展开",
+    )
+    return len(compact) <= 48 and not any(marker in compact for marker in detail_markers)
+
+
+def _query_wants_structure(prompt: str) -> bool:
+    markers = ("列出", "列表", "清单", "有哪些", "分别", "步骤", "条件", "要求")
+    return any(marker in prompt for marker in markers)
+
+
+def _needs_style_rewrite(prompt: str, text: str) -> bool:
+    """Detect report-like formatting that violates the conversational contract."""
+    heading_count = len(
+        re.findall(
+            r"(?m)^\s*(?:#{1,6}\s+|\*\*[^*\n]{2,24}\*\*\s*$)",
+            text,
+        )
+    )
+    bullet_count = len(re.findall(r"(?m)^\s*(?:[-*+]|\d+[.)、])\s+", text))
+    report_phrases = (
+        "直接回答",
+        "核心定位",
+        "几个关键特点",
+        "容易误解的地方",
+        "组织方式上",
+        "一个关键张力",
+        "从几个层面说",
+    )
+    report_like = any(phrase in text for phrase in report_phrases)
+    if _is_simple_query(prompt):
+        unnecessary_list = bullet_count >= 2 and not _query_wants_structure(prompt)
+        return heading_count > 0 or unnecessary_list or len(text) > 520 or report_like
+    return heading_count >= 2 or (heading_count > 0 and bullet_count >= 3) or report_like
+
+
+def _enforce_conversational_shape(prompt: str, text: str) -> str:
+    """Last-resort formatting guard when a style-only rewrite still ignores rules."""
+    paragraphs: list[str] = []
+    for block in re.split(r"\n\s*\n", text):
+        cleaned = block.strip()
+        if not cleaned:
+            continue
+        if re.fullmatch(r"(?:#{1,6}\s+)?\*\*[^*\n]{2,24}\*\*", cleaned):
+            continue
+        if re.fullmatch(r"#{1,6}\s+.+", cleaned):
+            continue
+        lines = []
+        for line in cleaned.splitlines():
+            if not _query_wants_structure(prompt):
+                line = re.sub(r"^\s*(?:[-*+]|\d+[.)、])\s+", "", line)
+            line = line.strip()
+            line = re.sub(r"^\*\*([^*]+)\*\*[：:]\s*", r"\1：", line)
+            if line:
+                lines.append(line)
+        cleaned = " ".join(lines).strip()
+        if not cleaned or cleaned.startswith(("如果你还想", "如果你想继续", "如果你在想")):
+            continue
+        paragraphs.append(cleaned)
+
+    if _is_simple_query(prompt):
+        paragraphs = paragraphs[:3]
+        result = "\n\n".join(paragraphs)
+        if len(result) > 420:
+            shortened = result[:420]
+            boundary = max(shortened.rfind(mark) for mark in "。！？")
+            result = shortened[: boundary + 1] if boundary >= 120 else shortened.rstrip()
+        return result.strip()
+    return "\n\n".join(paragraphs).strip()
+
+
 def _evidence_content_key(content: str) -> str:
     """Return a normalized form of evidence content for deduplication."""
     lines = content.splitlines()
@@ -787,6 +868,20 @@ grep 缩小范围，再按需浏览目录、读取原文；资料足够后直接
 不要试图在一次回答中把整个主题说清楚，只展开当前问题需要的部分，能用两三段说清楚
 就及时收住。最终回答必须自然、口语化，不附参考来源、文档路径、原文链接或引用编号。"""
 
+_STYLE_REWRITE_SYSTEM_PROMPT = """你只负责把已有回答改成 CAC 式的自然聊天表达。
+
+不要重新研究问题，不要增加新事实，也不要提到改写过程。保留原回答中与问题直接相关、
+且资料能够支持的核心意思，删掉为了显得完整而添加的铺陈。
+
+强制要求：
+- 直接进入回答，不使用标题或粗体小标题。除非原问题明确要求列举、步骤或清单，
+  否则不使用列表；简单定义问题禁止列清单。
+- 使用两到三个自然短段落，像在群聊里认真解释，不像社团介绍、百科或汇报材料。
+- 少堆抽象名词，能用普通说法就不用“核心定位、关键特点、能力培养、组织方式”等套话。
+- 不要试图一次把整个主题讲完；简单问题控制在大约 350 个汉字以内。
+- 不以“如果你还想了解……可以继续问”这类客服式追问收尾。
+- 不输出来源、文档名、路径、链接或引用编号。"""
+
 
 class NovaCacAgent(NjuQaAgent):
     """Single-pass AstrBot Agent with the ported local retrieval tools."""
@@ -829,4 +924,47 @@ class NovaCacAgent(NjuQaAgent):
         if not text:
             return AGENT_ERROR
         text = _strip_unverified_urls(text, set())
-        return _strip_source_appendix(text)
+        text = _strip_source_appendix(text)
+        if _needs_style_rewrite(prompt, text):
+            text = await self._rewrite_style(
+                event,
+                provider_id,
+                prompt,
+                text,
+                base_system_prompt,
+            )
+            text = _strip_source_appendix(_strip_unverified_urls(text, set()))
+            if _needs_style_rewrite(prompt, text):
+                text = _enforce_conversational_shape(prompt, text)
+        return text or AGENT_ERROR
+
+    async def _rewrite_style(
+        self,
+        event: object,
+        provider_id: str,
+        question: str,
+        draft: str,
+        base_system_prompt: str,
+    ) -> str:
+        rewrite_prompt = (
+            f"<原问题>\n{question}\n</原问题>\n\n"
+            f"<待改写回答>\n{draft}\n</待改写回答>"
+        )
+        try:
+            response = await self._run_tool_loop(
+                event=event,
+                chat_provider_id=provider_id,
+                prompt=rewrite_prompt,
+                system_prompt=(
+                    f"{base_system_prompt}\n\n{_STYLE_REWRITE_SYSTEM_PROMPT}"
+                ),
+                contexts=[],
+                tracker=SourceTracker(),
+                tools=[],
+                max_steps=1,
+            )
+        except Exception:
+            logger.exception("NOVA CAC style rewrite failed")
+            return _enforce_conversational_shape(question, draft)
+        rewritten = str(getattr(response, "completion_text", "") or "").strip()
+        return rewritten or _enforce_conversational_shape(question, draft)

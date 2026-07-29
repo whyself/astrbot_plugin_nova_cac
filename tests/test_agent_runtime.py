@@ -255,3 +255,91 @@ def test_nova_direct_agent_does_not_force_no_evidence_response():
     )
     assert answer == "这个问题可以先从你的实际目标说起。"
     assert answer != NO_EVIDENCE
+
+
+def test_nova_direct_agent_rewrites_report_style_into_cac_conversation():
+    calls = []
+    report_draft = """NOVA 是南京大学智能数据决策工作室。
+
+**核心定位**
+
+NOVA 关心的是发现问题、自主学习和协作创造。
+
+**几个关键特点**
+
+- 没有技术门槛，但有行动要求
+- 强调 PBL 学习模式
+- 强调分享与协作
+
+如果你还想了解具体活动，可以继续问。"""
+
+    async def loop(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return Response(report_draft)
+        return Response(
+            "NOVA 会做编程、数据和 AI 相关的事情，但它不太像传统的"
+            "技术培训社团。技术更像是工具，真正想练的是从真实问题出发，"
+            "自己学习、找人协作，再把想法一点点做出来。"
+        )
+
+    agent = NovaCacAgent(Context(), lambda tracker: [object()], loop)
+    answer = asyncio.run(
+        agent.answer(
+            Event(),
+            "NOVA 是什么？",
+            base_system_prompt="PACK",
+        )
+    )
+
+    assert len(calls) == 2
+    assert calls[1]["tools"] == []
+    assert calls[1]["max_steps"] == 1
+    assert "**核心定位**" not in answer
+    assert "\n-" not in answer
+    assert "可以继续问" not in answer
+    assert "技术更像是工具" in answer
+
+
+def test_nova_style_guard_strips_structure_when_rewrite_ignores_rules():
+    report_draft = """**核心定位**
+
+NOVA 不是培训班。
+
+**几个关键特点**
+
+- 从真实问题出发
+- 在实践中自主学习
+- 通过分享和协作获得反馈
+
+如果你还想了解活动，可以继续问。"""
+
+    async def loop(**_kwargs):
+        return Response(report_draft)
+
+    agent = NovaCacAgent(Context(), lambda tracker: [], loop)
+    answer = asyncio.run(
+        agent.answer(Event(), "NOVA 是什么？", base_system_prompt="PACK")
+    )
+
+    assert "**" not in answer
+    assert "\n-" not in answer
+    assert "可以继续问" not in answer
+    assert len(answer) <= 420
+
+
+def test_nova_style_gate_keeps_list_when_question_explicitly_requests_one():
+    calls = 0
+
+    async def loop(**_kwargs):
+        nonlocal calls
+        calls += 1
+        return Response("- 文档评议\n- 主题分享\n- 成员自主发起的项目")
+
+    agent = NovaCacAgent(Context(), lambda tracker: [], loop)
+    answer = asyncio.run(
+        agent.answer(Event(), "NOVA 有哪些活动？", base_system_prompt="PACK")
+    )
+
+    assert calls == 1
+    assert "- 文档评议" in answer
