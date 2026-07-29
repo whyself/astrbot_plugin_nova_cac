@@ -49,11 +49,11 @@ def _install_astrbot_shim() -> None:
             self.context = context
 
     class StarTools:
-        data_dir = Path(tempfile.gettempdir()) / "nova-cac-plugin-test"
+        _data_dir = Path(tempfile.gettempdir()) / "nova-cac-plugin-test"
 
         @classmethod
         def get_data_dir(cls, _plugin_name=None):
-            return cls.data_dir
+            return cls._data_dir
 
     class ToolSet:
         def __init__(self, tools):
@@ -113,12 +113,6 @@ class FakeContext:
     def __init__(self, data_dir: Path):
         self.data_dir = data_dir
 
-    def get_all_embedding_providers(self):
-        return []
-
-    def get_provider_by_id(self, _provider_id):
-        return None
-
 
 class FakeEvent:
     def __init__(self, text: str):
@@ -157,19 +151,19 @@ class MainIntegrationTests(unittest.TestCase):
 
     def test_plugin_indexes_embedded_pack_without_embedding_provider(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            sys.modules["astrbot.api.star"].StarTools.data_dir = Path(temp_dir)
+            sys.modules["astrbot.api.star"].StarTools._data_dir = Path(temp_dir)
             plugin = self.plugin_class(
                 FakeContext(Path(temp_dir)),
                 {"enable_vector_search": False},
             )
             asyncio.run(plugin.initialize())
-            self.assertGreater(len(plugin.corpus.documents), 0)
+            self.assertGreater(plugin.index.document_count(), 0)
             self.assertGreater(plugin.chunk_store.chunk_count(), 0)
             asyncio.run(plugin.terminate())
 
     def test_only_literal_slash_command_enters_plugin_history(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            sys.modules["astrbot.api.star"].StarTools.data_dir = Path(temp_dir)
+            sys.modules["astrbot.api.star"].StarTools._data_dir = Path(temp_dir)
             plugin = self.plugin_class(
                 FakeContext(Path(temp_dir)),
                 {"enable_vector_search": False},
@@ -200,21 +194,29 @@ class MainIntegrationTests(unittest.TestCase):
             self.assertEqual(len(plugin.memory.contexts("group:test")), 2)
             asyncio.run(plugin.terminate())
 
-    def test_embedding_documents_are_requested_in_bounded_batches(self):
-        class Provider:
-            def __init__(self):
-                self.batch_sizes = []
+    def test_source_list_requires_explicit_source_intent(self):
+        asks = self.plugin_class._asks_for_sources
+        for query in (
+            "这段话的来源是什么",
+            "给出参考资料",
+            "引用依据呢",
+            "请给出依据",
+            "请给出证据",
+            "URL",
+            "把原文链接发我",
+        ):
+            with self.subTest(query=query):
+                self.assertTrue(asks(query))
 
-            async def get_embeddings(self, texts):
-                self.batch_sizes.append(len(texts))
-                return [[float(index)] for index, _ in enumerate(texts)]
-
-        provider = Provider()
-        embed_many = self.plugin_class._batch_embedder(provider)
-        vectors = asyncio.run(embed_many([str(index) for index in range(65)]))
-        self.assertEqual(provider.batch_sizes, [32, 32, 1])
-        self.assertEqual(len(vectors), 65)
-
+        for query in (
+            "如何链接 GitHub",
+            "把这两个概念链接起来",
+            "NOVA 文献综述活动是什么？",
+            "如何阅读引用内容",
+            "NOVA 是什么",
+        ):
+            with self.subTest(query=query):
+                self.assertFalse(asks(query))
 
 if __name__ == "__main__":
     unittest.main()

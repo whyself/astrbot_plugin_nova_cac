@@ -4,6 +4,8 @@ Copyright (C) 2026 whyself
 Version 0.2.0 incorporates and adapts implementation ideas and source code
 from astrbot_plugin_nju_qa:
 https://github.com/Gu-Heping/astrbot_plugin_nju_qa
+Ported baseline commit:
+275d8b8d17aa86615fbb39f4a23291d32bed3643
 
 astrbot_plugin_nju_qa is distributed under the GNU Affero General Public
 License version 3. The combined and modified work is therefore distributed

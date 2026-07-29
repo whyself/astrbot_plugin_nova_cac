@@ -36,7 +36,7 @@ class ChunkVectorIndex:
     @classmethod
     def _collection_name_for(cls, model: str) -> str:
         model_slug = hashlib.sha256(model.encode("utf-8")).hexdigest()[:12]
-        return f"nova_cac_chunks_{cls.EMBEDDING_VERSION}_{model_slug}"
+        return f"nju_qa_chunks_{cls.EMBEDDING_VERSION}_{model_slug}"
 
     def _ensure_client(self):
         import chromadb

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import weakref
 from pathlib import Path
 from typing import Any
@@ -19,16 +20,25 @@ from .nova_cac.agent import (
     NovaCacAgent,
 )
 from .nova_cac.chunk_store import ChunkStore
+from .nova_cac.config import PluginConfig
 from .nova_cac.core import ConversationMemory, PackLoader
-from .nova_cac.local_corpus import LocalCorpus
+from .nova_cac.document_index import DocumentIndex
+from .nova_cac.document_store import DocumentStore
+from .nova_cac.local_sync import LocalPackSync
 from .nova_cac.retriever import HybridRetriever
 from .nova_cac.routing import extract_cac_query
 from .nova_cac.tools import (
+    DocStatsTool,
+    GetDocDetailsTool,
     GetDocOutlineTool,
     GrepLocalDocsTool,
-    ListDocsTool,
+    ListKnowledgeBasesTool,
+    ListRepoDocsTool,
+    ListRepoTreeTool,
+    ParseYuqueUrlTool,
     ReadDocTool,
     SearchKnowledgeBaseTool,
+    SearchDocsTool,
 )
 from .nova_cac.vector_index import ChunkVectorIndex
 
@@ -37,7 +47,7 @@ from .nova_cac.vector_index import ChunkVectorIndex
     "astrbot_plugin_nova_cac",
     "whyself",
     "基于本地 NOVA 知识包与近期上下文的 CAC 风格问答",
-    "0.2.0",
+    "0.3.0",
 )
 class NovaCacPlugin(Star):
     """Explicitly triggered `/cac` knowledge Q&A."""
@@ -46,6 +56,7 @@ class NovaCacPlugin(Star):
         super().__init__(context)
         self.context = context
         self.config = config or {}
+        self.agent_config = PluginConfig.from_mapping(self.config)
 
         pack_root = Path(__file__).resolve().parent / "knowledge_pack"
         self.pack_loader = PackLoader(pack_root)
@@ -64,94 +75,75 @@ class NovaCacPlugin(Star):
                 maximum=50000,
             ),
         )
-        retrieval_top_k = self._config_int(
-            "retrieval_top_k",
-            5,
-            minimum=1,
-            maximum=12,
-        )
-        score_threshold = self._config_float(
-            "score_threshold",
-            0.2,
-            minimum=0.0,
-            maximum=1.0,
-        )
-
         data_dir = StarTools.get_data_dir("astrbot_plugin_nova_cac")
         self._data_dir = data_dir
+        self.store = DocumentStore(data_dir / "documents")
+        self.index = DocumentIndex(data_dir / "nova_cac.sqlite3")
         self.chunk_store = ChunkStore(data_dir / "chunks.sqlite3")
-        embedding_provider = self._resolve_embedding_provider()
-        embedding_key = self._embedding_key(embedding_provider)
-        vector_enabled = self._config_bool("enable_vector_search", True)
-        vector_index = None
-        embed_one = None
-        embed_many = None
-        if vector_enabled and embedding_provider is not None:
-            dimension = self._embedding_dimension(embedding_provider)
-            vector_index = ChunkVectorIndex(
-                data_dir / "vectors",
-                model=embedding_key,
-                embedding_dimension=dimension,
-            )
-            embed_one = embedding_provider.get_embedding
-            embed_many = self._batch_embedder(embedding_provider)
-        elif vector_enabled:
-            logger.warning(
-                "NOVA CAC vector search disabled at runtime: "
-                "no AstrBot Embedding Provider is available"
-            )
-
-        chunk_size = self._config_int(
-            "chunk_size",
-            1200,
-            minimum=200,
-            maximum=8000,
+        self.vector_index = ChunkVectorIndex(
+            data_dir / "vectors",
+            self.agent_config.embedding_model,
         )
-        configured_overlap = self._config_int(
-            "chunk_overlap",
-            180,
-            minimum=0,
-            maximum=1000,
-        )
-        chunk_overlap = min(configured_overlap, max(0, chunk_size // 2 - 1))
-        self.corpus = LocalCorpus(
+        self.syncer = LocalPackSync(
             pack_root / "knowledge",
+            self.store,
+            self.index,
             self.chunk_store,
-            vector_index=vector_index,
-            embed_many=embed_many,
-            embedding_key=embedding_key,
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
+            self.vector_index,
+            self.agent_config,
+            state_path=data_dir / "local_pack_state.json",
         )
         self.retriever = HybridRetriever(
-            self.corpus,
-            self.chunk_store,
-            vector_index=vector_index,
-            embed_one=embed_one,
-            top_k=retrieval_top_k,
-            score_threshold=score_threshold,
+            self.index,
+            self.agent_config,
+            chunk_store=self.chunk_store,
+            vector_index=self.vector_index,
         )
-        diagnostics = self._config_bool("retrieval_diagnostics", False)
         self.agent = NovaCacAgent(
             self.context,
             lambda tracker: [
-                SearchKnowledgeBaseTool(
-                    retriever=self.retriever,
-                    tracker=tracker,
+                SearchKnowledgeBaseTool(retriever=self.retriever, tracker=tracker),
+                GrepLocalDocsTool(
+                    index=self.index, docs_root=self.store.root, tracker=tracker
                 ),
-                GrepLocalDocsTool(corpus=self.corpus),
-                ReadDocTool(corpus=self.corpus, tracker=tracker),
-                ListDocsTool(corpus=self.corpus),
-                GetDocOutlineTool(corpus=self.corpus),
+                ReadDocTool(
+                    index=self.index, docs_root=self.store.root, tracker=tracker
+                ),
+                SearchDocsTool(
+                    index=self.index, docs_root=self.store.root, tracker=tracker
+                ),
+                GetDocDetailsTool(
+                    index=self.index, docs_root=self.store.root, tracker=tracker
+                ),
+                ParseYuqueUrlTool(
+                    index=self.index, docs_root=self.store.root, tracker=tracker
+                ),
+                ListKnowledgeBasesTool(
+                    index=self.index, docs_root=self.store.root, tracker=tracker
+                ),
+                ListRepoDocsTool(
+                    index=self.index, docs_root=self.store.root, tracker=tracker
+                ),
+                ListRepoTreeTool(
+                    index=self.index, docs_root=self.store.root, tracker=tracker
+                ),
+                GetDocOutlineTool(
+                    index=self.index, docs_root=self.store.root, tracker=tracker
+                ),
+                DocStatsTool(
+                    index=self.index, docs_root=self.store.root, tracker=tracker
+                ),
             ],
-            diagnostics=diagnostics,
+            docs_root=self.store.root,
+            index=self.index,
+            diagnostics=self.agent_config.retrieval_diagnostics,
         )
         self._session_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
             weakref.WeakValueDictionary()
         )
 
     async def initialize(self) -> None:
-        result = await self.corpus.refresh()
+        result = await self.syncer.refresh()
         logger.info(
             "NOVA CAC local corpus: documents=%s chunks=%s rebuilt=%s vector_ready=%s",
             result.get("documents"),
@@ -163,7 +155,9 @@ class NovaCacPlugin(Star):
             logger.warning("NOVA CAC vector index fallback: %s", result["vector_error"])
 
     async def terminate(self) -> None:
-        self.corpus.close()
+        self.index.close()
+        self.chunk_store.close()
+        self.vector_index.close()
 
     @filter.regex(r"^/?cac(?:\s+.*)?$")
     async def cac(self, event: AstrMessageEvent):
@@ -193,6 +187,7 @@ class NovaCacPlugin(Star):
 
         async with self._session_lock(session_key):
             try:
+                await self.syncer.refresh()
                 system_prompt = await asyncio.to_thread(
                     self.pack_loader.build_system_prompt
                 )
@@ -201,6 +196,7 @@ class NovaCacPlugin(Star):
                     query,
                     base_system_prompt=system_prompt,
                     contexts=self.memory.contexts(session_key),
+                    include_sources=self._asks_for_sources(query),
                 )
                 if not answer:
                     yield event.plain_result(AGENT_ERROR)
@@ -265,59 +261,6 @@ class NovaCacPlugin(Star):
         raw: Any = getter(key, default) if callable(getter) else default
         return str(raw or default).strip()
 
-    def _resolve_embedding_provider(self):
-        provider_id = self._config_str("embedding_provider_id")
-        if provider_id:
-            provider = self.context.get_provider_by_id(provider_id)
-            if provider is not None and hasattr(provider, "get_embedding"):
-                return provider
-            logger.warning(
-                "NOVA CAC configured Embedding Provider was not found: %s",
-                provider_id,
-            )
-            return None
-        providers = self.context.get_all_embedding_providers()
-        return providers[0] if providers else None
-
-    def _embedding_key(self, provider) -> str:
-        if provider is None:
-            return ""
-        configured = self._config_str("embedding_provider_id")
-        provider_config = getattr(provider, "provider_config", {}) or {}
-        provider_id = (
-            configured
-            or str(provider_config.get("id", ""))
-            or type(provider).__name__
-        )
-        model = str(
-            provider_config.get("model", "")
-            or provider_config.get("model_name", "")
-            or type(provider).__name__
-        )
-        dimension = self._embedding_dimension(provider) or "unknown"
-        return f"provider={provider_id}|model={model}|dimension={dimension}"
-
-    @staticmethod
-    def _embedding_dimension(provider) -> int | None:
-        getter = getattr(provider, "get_dim", None)
-        if not callable(getter):
-            return None
-        try:
-            dimension = int(getter())
-            return dimension if dimension > 0 else None
-        except (TypeError, ValueError):
-            return None
-
-    @staticmethod
-    def _batch_embedder(provider):
-        async def embed_many(texts: list[str]) -> list[list[float]]:
-            vectors: list[list[float]] = []
-            for start in range(0, len(texts), 32):
-                vectors.extend(await provider.get_embeddings(texts[start : start + 32]))
-            return vectors
-
-        return embed_many
-
     def _session_lock(self, session_key: str) -> asyncio.Lock:
         lock = self._session_locks.get(session_key)
         if lock is None:
@@ -364,4 +307,49 @@ class NovaCacPlugin(Star):
             "群聊或私聊：/cac <问题>\n"
             "/cac reset：清空当前会话的近期上下文\n"
             "/cac help：查看用法"
+        )
+
+    @staticmethod
+    def _asks_for_sources(query: str) -> bool:
+        text = query.casefold().strip()
+        source_terms = (
+            r"来源|出处|原文|参考资料|参考来源|参考文献|"
+            r"资料依据|引用依据|依据|证据"
+        )
+        if re.search(
+            rf"(?:请|麻烦|能否|可以)?"
+            rf"(?:给|给出|提供|发|附|附上|列出|说明|注明|展示|告诉我|找出)"
+            rf".{{0,10}}(?:{source_terms})",
+            text,
+        ):
+            return True
+        if re.search(
+            r"(?:来源|出处|参考资料|参考来源|参考文献|资料依据|引用依据|依据|证据)"
+            r".{0,3}(?:是什么|在哪(?:里)?|哪里|哪儿|呢|吗|有吗|怎么来的|[？?])",
+            text,
+        ):
+            return True
+        if re.fullmatch(
+            rf"(?:{source_terms})(?:是什么|在哪(?:里)?|哪里|呢|吗|有吗)?[？?！!。]?",
+            text,
+        ):
+            return True
+        if re.fullmatch(
+            r"(?:url|source|sources|citation|citations)[?!.]?",
+            text,
+        ):
+            return True
+        if re.search(
+            r"\b(?:give|provide|show|list|cite)\b.{0,30}"
+            r"\b(?:source|sources|citation|citations|url)\b",
+            text,
+        ):
+            return True
+        return bool(
+            re.search(
+                r"(?:给|提供|发|附).{0,5}(?:链接|地址)"
+                r"|(?:原文|文档|文章|资料).{0,5}(?:链接|地址)"
+                r"|^(?:链接|地址)(?:呢|吗|发一下|给我)?[？?！!。]?$",
+                text,
+            )
         )

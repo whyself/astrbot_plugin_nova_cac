@@ -1,300 +1,768 @@
-"""Two-stage evidence-first Agent adapted from astrbot_plugin_nju_qa."""
+"""Evidence-first two-stage Agent for NJU QA.
+
+The Agent splits every factual question into two phases:
+
+1. Research phase: the model may use search/navigation/reading tools to locate
+   and read concrete evidence.  The natural-language text produced by this
+   phase is ignored; only the evidence that was actually read is retained.
+
+2. Answer phase: the model receives the original question and the collected
+   evidence excerpts, and must answer using only those excerpts.  Every factual
+   claim must be marked with an internal evidence id ``[E#]``.  Citations are
+   rendered only for the excerpts the model actually used.
+"""
 
 from __future__ import annotations
 
-import logging
 import re
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
 
-try:
-    from astrbot.api import logger
-except ImportError:  # pragma: no cover - local unit-test fallback
-    logger = logging.getLogger("nova_cac")
+from astrbot.api import logger
 
-from .evidence import EvidenceExcerpt, SourceTracker
-from .prompts import ANSWER_PROMPT, RESEARCH_PROMPT, SMALL_TALK_PROMPT
+from .doc_utils import read_document_content
+from .evidence import (
+    EvidenceExcerpt,
+    classify_version_status,
+    evidence_excerpts_from_read,
+)
+from .models import SearchResult
+from .prompts import (
+    ANSWER_SYSTEM_PROMPT,
+    RESEARCH_SYSTEM_PROMPT,
+    SMALL_TALK_SYSTEM_PROMPT,
+)
 
-NO_PROVIDER = "当前没有可用的聊天模型，请先在 AstrBot 中配置提供商。"
-NO_EVIDENCE = "目前资料里没有找到足够明确的内容。"
-AGENT_ERROR = "这次回答没有生成成功，请稍后再试。"
-SAFE_FAILURE = "现有证据还不足以形成可靠回答。"
+
+NO_PROVIDER = "当前未配置 LLM 服务。请联系管理员配置后再试。"
+AGENT_ERROR = "当前无法调用 LLM 服务，请稍后重试。"
+NO_EVIDENCE = "知识库中暂未找到可靠资料，我不能据此给出 NOVA 的具体结论。"
+SAFE_FAILURE = "当前无法根据知识库给出可靠回答，请稍后重试或换个方式提问。"
+
+_MAX_EVIDENCE = 7
+_MAX_RESEARCH_STEPS = 12
+_MAX_ANSWER_STEPS = 3
+_NO_EVIDENCE_MARKERS = ("知识库中暂未找到可靠资料", "知识库中暂未找到可靠答案")
+
+_SMALL_TALK_PATTERNS: list[re.Pattern] = [
+    re.compile(r"^(你好|您好|嗨|哈喽|hello|hi|hey|在吗|在不在|早上好|下午好|晚上好)([！!。，,？?\s]|$)", re.IGNORECASE),
+    re.compile(r"^(谢谢|多谢|感谢|拜拜|再见|bye|goodbye)([！!。，,？?\s]|$)", re.IGNORECASE),
+    re.compile(r"^(你?是谁|你叫什么|你叫什么名字|介绍一下你|自我介绍一下)"),
+    re.compile(r"^(你?能做什么|你?会什么|你?有什么功能|帮助|help|怎么用)"),
+    re.compile(r"^(好的|行|可以|ok|okay|知道了|明白)([！!。，,？?\s]|$)", re.IGNORECASE),
+]
+
+
+def _is_small_talk(prompt: str) -> bool:
+    """Return True only when the whole message is a pure conversational opener."""
+    text = prompt.strip()
+    if not text:
+        return True
+    for pattern in _SMALL_TALK_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            # Anything beyond the greeting (except trailing punctuation/space)
+            # means the message also contains a factual question.
+            tail = text[match.end():].strip(" \t\n\r！!。，,、；：:？?\"'")
+            if not tail:
+                return True
+    return False
+
+
+def _strip_unverified_urls(text: str, allowed_urls: set[str]) -> str:
+    """Remove URLs not present in ``allowed_urls`` to prevent hallucinated links."""
+
+    def replace(match: re.Match) -> str:
+        url = match.group(0)
+        # Allow exact matches or URLs that share a prefix with an allowed URL.
+        if url in allowed_urls:
+            return url
+        for allowed in allowed_urls:
+            if url.startswith(allowed) or allowed.startswith(url):
+                return url
+        return ""
+
+    return re.sub(r"https?://[^\s<>()，。；：）]+", replace, text)
+
+
+def _evidence_content_key(content: str) -> str:
+    """Return a normalized form of evidence content for deduplication."""
+    lines = content.splitlines()
+    stripped = [re.sub(r"^\s*\d+[:.\s]+", "", line).strip() for line in lines]
+    collapsed = re.sub(r"\s+", " ", " ".join(stripped)).strip()
+    return collapsed.casefold()
+
+
+def _evidence_overlap(a: EvidenceExcerpt, b: EvidenceExcerpt) -> bool:
+    """Return True when two excerpts cover an overlapping line range in the same source."""
+    if a.line_start is None or b.line_start is None:
+        return False
+    a_end = a.line_end if a.line_end is not None else a.line_start
+    b_end = b.line_end if b.line_end is not None else b.line_start
+    return (
+        (a.document_id or a.file_path or a.url)
+        == (b.document_id or b.file_path or b.url)
+        and max(a.line_start, b.line_start) <= min(a_end, b_end)
+    )
+
+
+def _merge_excerpt_contents(a: EvidenceExcerpt, b: EvidenceExcerpt) -> str:
+    """Merge two overlapping excerpts by uniting their full lines.
+
+    Lines prefixed with ``N: `` are sorted by line number; other lines keep
+    their original order and are deduplicated.
+    """
+    def _iter(content: str):
+        for line in content.splitlines():
+            match = re.match(r"^(\d+):\s?(.*)$", line)
+            if match:
+                yield int(match.group(1)), line
+            else:
+                yield None, line
+
+    a_items = list(_iter(a.content))
+    b_items = list(_iter(b.content))
+    all_have_numbers = all(n is not None for n, _ in a_items + b_items)
+
+    seen: set[Any] = set()
+    combined: list[tuple[int | None, str]] = []
+    for num, line in a_items + b_items:
+        key = (num, _evidence_content_key(line)) if num is not None else _evidence_content_key(line)
+        if key in seen:
+            continue
+        seen.add(key)
+        combined.append((num, line))
+
+    if all_have_numbers:
+        combined.sort(key=lambda item: (item[0], 0))
+    return "\n".join(line for _, line in combined)
+
+
+def _copy_excerpt_metadata(target: EvidenceExcerpt, source: EvidenceExcerpt) -> None:
+    """Copy content and metadata from ``source`` to ``target`` while keeping id."""
+    target.document_id = source.document_id
+    target.title = source.title
+    target.url = source.url
+    target.file_path = source.file_path
+    target.content = source.content
+    target.evidence_type = source.evidence_type
+    target.qa_status = source.qa_status
+    target.historical = source.historical
+    target.score = source.score
+    target.applicable_years = source.applicable_years
+    target.applicable_cohorts = source.applicable_cohorts
+    target.document_year = source.document_year
+    target.version_status = source.version_status
+    target.historical_reason = source.historical_reason
+
+
+def _merge_excerpts(existing: EvidenceExcerpt, new: EvidenceExcerpt) -> EvidenceExcerpt | None:
+    """Attempt to merge ``new`` into ``existing``.
+
+    Returns the merged ``existing`` when a reliable merge is possible, otherwise
+    ``None`` to signal that both excerpts should be kept.
+    """
+    existing_norm = _evidence_content_key(existing.content)
+    new_norm = _evidence_content_key(new.content)
+
+    if existing_norm in new_norm:
+        # ``new`` truly contains ``existing``: keep the container but reuse the
+        # existing evidence id so citations stay stable.
+        existing.line_start = (
+            new.line_start
+            if new.line_start is not None
+            else existing.line_start
+        )
+        existing.line_end = (
+            new.line_end
+            if new.line_end is not None
+            else existing.line_end
+        )
+        _copy_excerpt_metadata(existing, new)
+        return existing
+
+    if new_norm in existing_norm:
+        # ``existing`` already contains ``new``.
+        return existing
+
+    # Partial overlap: merge full lines.  If the line ranges do not actually
+    # share any lines, do not force a merge.
+    if existing.line_start is None or new.line_start is None:
+        return None
+    existing_end = existing.line_end if existing.line_end is not None else existing.line_start
+    new_end = new.line_end if new.line_end is not None else new.line_start
+    if max(existing.line_start, new.line_start) > min(existing_end, new_end):
+        return None
+
+    merged_content = _merge_excerpt_contents(existing, new)
+    existing.content = merged_content
+    existing.line_start = min(existing.line_start, new.line_start)
+    existing.line_end = max(existing_end, new_end)
+    existing.applicable_years = sorted(
+        set((existing.applicable_years or []) + (new.applicable_years or []))
+    ) or None
+    existing.applicable_cohorts = sorted(
+        set((existing.applicable_cohorts or []) + (new.applicable_cohorts or []))
+    ) or None
+    if new.document_year is not None:
+        existing.document_year = new.document_year
+    existing.version_status, existing.historical_reason = classify_version_status(
+        existing.title,
+        existing.file_path or None,
+        existing.content,
+        existing.applicable_years,
+        existing.document_year,
+    )
+    existing.historical = existing.version_status in {"historical", "archived"}
+    return existing
+
+
+def _extract_used_evidence_ids(text: str) -> list[str]:
+    """Return ordered evidence ids used by the model, e.g. ['E1','E3']."""
+    return list(dict.fromkeys(f"E{m}" for m in re.findall(r"\[E(\d+)]", text)))
+
+
+def _is_pure_no_evidence(text: str) -> bool:
+    """Return True when the answer contains no substantive information."""
+    cleaned = text
+    for marker in _NO_EVIDENCE_MARKERS:
+        cleaned = cleaned.replace(marker, "")
+    cleaned = re.sub(r"[^\w一-鿿]", "", cleaned).strip()
+    return not cleaned
+
+
+@dataclass
+class SourceTracker:
+    """Tracks candidate sources and concrete evidence excerpts.
+
+    * candidate_sources  -- search/grep results used to locate documents.
+    * evidence_excerpts  -- actual text read by the model (the only thing that
+                            may ground a factual answer).
+    * selected_excerpts  -- excerpts chosen for the final answer prompt.
+    """
+
+    candidate_sources: list[SearchResult] = field(default_factory=list)
+    evidence_excerpts: list[EvidenceExcerpt] = field(default_factory=list)
+    selected_excerpts: list[EvidenceExcerpt] = field(default_factory=list)
+    read_sources: set[str] = field(default_factory=set)
+    verified_urls: set[str] = field(default_factory=set)
+    diagnostics: bool = False
+
+    def reset(self) -> None:
+        self.candidate_sources.clear()
+        self.evidence_excerpts.clear()
+        self.selected_excerpts.clear()
+        self.read_sources.clear()
+        self.verified_urls.clear()
+
+    def record_urls(self, content: str) -> None:
+        self.verified_urls.update(re.findall(r"https?://[^\s<>()，。；：]+", content))
+
+    def add_candidates(self, results: list[SearchResult]) -> None:
+        """Register search results as candidates, not as final evidence."""
+        by_id: dict[str, int] = {
+            item.document.yuque_id: i
+            for i, item in enumerate(self.candidate_sources)
+            if item.document.yuque_id
+        }
+        for item in results:
+            content = (
+                item.chunk.content_snippet if item.chunk else item.document.body
+            )
+            if content:
+                self.record_urls(content)
+            if not item.document.yuque_id:
+                self.candidate_sources.append(item)
+                continue
+            idx = by_id.get(item.document.yuque_id)
+            if idx is None:
+                self.candidate_sources.append(item)
+                by_id[item.document.yuque_id] = len(self.candidate_sources) - 1
+            else:
+                existing = self.candidate_sources[idx]
+                if item.score > existing.score:
+                    self.candidate_sources[idx] = item
+                    by_id[item.document.yuque_id] = idx
+
+    def add_grep_hits(self, hits: list[dict], query_terms: list[str]) -> None:
+        """Compatibility shim: grep hits are candidate evidence only."""
+        from .evidence import grep_hits_to_search_results
+
+        self.add_candidates(grep_hits_to_search_results(hits, query_terms))
+
+    def add_read_document(
+        self,
+        document,
+        content: str,
+        line_start: int | None = None,
+        line_end: int | None = None,
+    ) -> None:
+        """Record a document read as concrete evidence."""
+        self.record_urls(content)
+        for excerpt in evidence_excerpts_from_read(
+            document,
+            content[:2400],
+            line_start=line_start,
+            line_end=line_end,
+        ):
+            self.add_evidence(excerpt)
+
+    def add_evidence(self, excerpt: EvidenceExcerpt) -> EvidenceExcerpt:
+        """Append an evidence excerpt, deduplicating by source + lines + content.
+
+        Exact duplicates are returned without creating a new excerpt.  Overlapping
+        excerpts for the same source are merged so that nearby reads do not spam
+        the evidence list.
+        """
+        if not excerpt.evidence_id:
+            # Reserve a provisional id; it will only be used if the excerpt is kept.
+            excerpt.evidence_id = f"E{len(self.evidence_excerpts) + 1}"
+
+        new_key = (
+            excerpt.document_id or excerpt.file_path or excerpt.url,
+            excerpt.line_start,
+            excerpt.line_end,
+            _evidence_content_key(excerpt.content),
+        )
+
+        for existing in self.evidence_excerpts:
+            existing_key = (
+                existing.document_id or existing.file_path or existing.url,
+                existing.line_start,
+                existing.line_end,
+                _evidence_content_key(existing.content),
+            )
+            if existing_key == new_key:
+                return existing
+
+            if _evidence_overlap(existing, excerpt):
+                merged = _merge_excerpts(existing, excerpt)
+                if merged is not None:
+                    return merged
+
+        self.evidence_excerpts.append(excerpt)
+        if excerpt.evidence_type != "navigation":
+            self.read_sources.add(excerpt.file_path or excerpt.document_id)
+        self.record_urls(excerpt.content)
+        return excerpt
+
+    @property
+    def read_count(self) -> int:
+        return len(self.read_sources)
+
 
 ToolFactory = Callable[[SourceTracker], list[object]]
 ToolLoop = Callable[..., Awaitable[object]]
 
 
-class NovaCacAgent:
-    """Research with tools, then answer only from selected evidence."""
+class NjuQaAgent:
+    """Two-stage evidence-first Agent."""
 
     def __init__(
         self,
         context: object,
         tools: ToolFactory,
-        *,
         tool_loop: ToolLoop | None = None,
+        docs_root: Path | None = None,
+        index: Any = None,
         diagnostics: bool = False,
-    ) -> None:
+    ):
         self.context = context
         self.tools = tools
         self._tool_loop = tool_loop
+        self.docs_root = docs_root
+        self.index = index
         self.diagnostics = diagnostics
 
     async def answer(
         self,
         event: object,
         prompt: str,
+        tracker: SourceTracker | None = None,
         *,
-        base_system_prompt: str,
+        base_system_prompt: str = "",
         contexts: list[dict[str, str]] | None = None,
+        include_sources: bool = True,
     ) -> str:
         provider_id = await self.context.get_current_chat_provider_id(
             getattr(event, "unified_msg_origin")
         )
+        logger.info("NOVA agent start: provider=%s prompt=%r", provider_id, prompt)
         if not provider_id:
+            logger.warning("NOVA agent: no chat provider configured")
             return NO_PROVIDER
-        contexts = contexts or []
 
         if _is_small_talk(prompt):
-            return await self._small_talk(
-                event,
-                provider_id,
-                prompt,
-                base_system_prompt,
-                contexts,
+            return await self._answer_small_talk(
+                event, prompt, base_system_prompt, contexts or []
             )
 
-        tracker = SourceTracker(diagnostics=self.diagnostics)
-        await self._research(
+        if tracker is None:
+            tracker = SourceTracker()
+        tracker.diagnostics = self.diagnostics
+        await self._research_phase(
             event,
-            provider_id,
             prompt,
-            base_system_prompt,
-            contexts,
             tracker,
+            base_system_prompt,
+            contexts or [],
         )
-        if self.diagnostics:
-            logger.info(
-                "NOVA CAC evidence: candidates=%s reads=%s files=%s",
-                len(tracker.candidate_sources),
-                len(tracker.evidence_excerpts),
-                sorted({item.file_path for item in tracker.evidence_excerpts}),
-            )
+
         if not tracker.evidence_excerpts:
+            logger.info("NOVA agent: no evidence excerpts after research")
             return NO_EVIDENCE
-        return await self._answer_from_evidence(
+
+        self._log_evidence_summary(tracker)
+        return await self._answer_phase(
             event,
-            provider_id,
             prompt,
-            base_system_prompt,
-            contexts,
             tracker,
+            base_system_prompt,
+            contexts or [],
+            include_sources,
         )
 
-    async def _small_talk(
+    async def _answer_small_talk(
         self,
-        event,
-        provider_id: str,
+        event: object,
         prompt: str,
         base_system_prompt: str,
         contexts: list[dict[str, str]],
     ) -> str:
+        provider_id = await self.context.get_current_chat_provider_id(
+            getattr(event, "unified_msg_origin")
+        )
         try:
             response = await self._run_tool_loop(
                 event=event,
                 chat_provider_id=provider_id,
                 prompt=prompt,
-                system_prompt=f"{base_system_prompt}\n\n{SMALL_TALK_PROMPT}",
+                system_prompt=f"{base_system_prompt}\n\n{SMALL_TALK_SYSTEM_PROMPT}",
                 contexts=contexts,
                 tracker=SourceTracker(),
-                tools=[],
-                max_steps=2,
             )
-            return str(getattr(response, "completion_text", "") or "").strip() or AGENT_ERROR
-        except Exception:  # noqa: BLE001
-            logger.exception("NOVA CAC small-talk phase failed")
+        except Exception:
+            logger.exception("NOVA agent small-talk failed")
             return AGENT_ERROR
+        text = str(getattr(response, "completion_text", "")).strip()
+        logger.info("NOVA agent small-talk: length=%d", len(text))
+        return text
 
-    async def _research(
+    async def _research_phase(
         self,
-        event,
-        provider_id: str,
+        event: object,
         prompt: str,
-        base_system_prompt: str,
-        contexts: list[dict[str, str]],
         tracker: SourceTracker,
+        base_system_prompt: str = "",
+        contexts: list[dict[str, str]] | None = None,
     ) -> None:
+        provider_id = await self.context.get_current_chat_provider_id(
+            getattr(event, "unified_msg_origin")
+        )
+        if self.diagnostics:
+            logger.info(
+                "NOVA agent research start: prompt=%r tools=%s",
+                prompt,
+                [getattr(t, "name", "") for t in self.tools(tracker)],
+            )
         try:
-            await self._run_tool_loop(
+            response = await self._run_tool_loop(
                 event=event,
                 chat_provider_id=provider_id,
                 prompt=prompt,
-                system_prompt=f"{base_system_prompt}\n\n{RESEARCH_PROMPT}",
-                contexts=contexts,
+                system_prompt=f"{base_system_prompt}\n\n{RESEARCH_SYSTEM_PROMPT}",
+                contexts=contexts or [],
                 tracker=tracker,
-                max_steps=8,
+                max_steps=_MAX_RESEARCH_STEPS,
             )
-        except Exception:  # noqa: BLE001
-            logger.exception("NOVA CAC research phase failed")
+        except Exception:
+            logger.exception("NOVA agent research phase failed")
+            return
+        # Ignore any natural-language answer produced during research; only the
+        # evidence recorded by the tools matters.
+        text = str(getattr(response, "completion_text", "")).strip()
+        if self.diagnostics and text:
+            logger.info("NOVA agent research discarded text: %d chars", len(text))
 
-    async def _answer_from_evidence(
-        self,
-        event,
-        provider_id: str,
-        question: str,
-        base_system_prompt: str,
-        contexts: list[dict[str, str]],
-        tracker: SourceTracker,
-    ) -> str:
-        excerpts = sorted(
+    def _select_excerpts(
+        self, tracker: SourceTracker, max_excerpts: int = _MAX_EVIDENCE
+    ) -> list[EvidenceExcerpt]:
+        """Choose the best concrete evidence for the answer prompt."""
+        # Prefer direct reads over outlines and navigation summaries.
+        type_order = {"read": 0, "details": 1, "outline": 2, "navigation": 3}
+        scored = sorted(
             tracker.evidence_excerpts,
-            key=lambda excerpt: (-excerpt.score, -len(excerpt.content)),
-        )[:7]
+            key=lambda e: (
+                type_order.get(e.evidence_type, 4),
+                -e.score,
+                -len(e.content),
+            ),
+        )
+        return scored[:max_excerpts]
+
+    async def _answer_phase(
+        self,
+        event: object,
+        prompt: str,
+        tracker: SourceTracker,
+        base_system_prompt: str = "",
+        contexts: list[dict[str, str]] | None = None,
+        include_sources: bool = True,
+    ) -> str:
+        provider_id = await self.context.get_current_chat_provider_id(
+            getattr(event, "unified_msg_origin")
+        )
+        excerpts = self._select_excerpts(tracker)
         tracker.selected_excerpts = excerpts
-        grounded_prompt = _build_grounded_prompt(question, excerpts)
-        text = ""
+
+        if not excerpts:
+            logger.info("NOVA agent: no selected excerpts for answer")
+            return NO_EVIDENCE
+
+        grounded_prompt = self._build_answer_prompt(prompt, excerpts)
+        answer_tools = self._answer_tools(tracker)
+
+        if self.diagnostics:
+            logger.info(
+                "NOVA agent answer start: selected=%d ids=%s tools=%s",
+                len(excerpts),
+                [e.evidence_id for e in excerpts],
+                [getattr(t, "name", "") for t in answer_tools],
+            )
+
         for attempt in range(2):
             try:
                 response = await self._run_tool_loop(
                     event=event,
                     chat_provider_id=provider_id,
                     prompt=grounded_prompt,
-                    system_prompt=f"{base_system_prompt}\n\n{ANSWER_PROMPT}",
-                    contexts=contexts,
+                    system_prompt=f"{base_system_prompt}\n\n{ANSWER_SYSTEM_PROMPT}",
+                    contexts=contexts or [],
                     tracker=tracker,
-                    tools=[],
-                    max_steps=3,
+                    tools=answer_tools,
+                    max_steps=_MAX_ANSWER_STEPS,
                 )
-            except Exception:  # noqa: BLE001
-                logger.exception("NOVA CAC answer phase failed")
+            except Exception:
+                logger.exception("NOVA agent answer phase failed")
                 return AGENT_ERROR
-            text = str(getattr(response, "completion_text", "") or "").strip()
-            if _is_no_evidence(text) or _all_claims_grounded(text, excerpts):
+            text = str(getattr(response, "completion_text", "")).strip()
+            used_ids = _extract_used_evidence_ids(text)
+            if used_ids or _is_pure_no_evidence(text):
                 break
-            grounded_prompt += (
-                "\n\n上一版存在未逐句标注或无效的 [E#] 证据，"
-                "请让每个事实句都紧跟有效证据标记后重答。"
+            logger.warning(
+                "NOVA agent: answer missing evidence markers (attempt %d)", attempt + 1
+            )
+            grounded_prompt = (
+                grounded_prompt
+                + "\n\n注意：你刚才的回答没有使用任何 [E#] 标记。"
+                "请重新回答，并确保每个事实都附带 [E#] 标记。"
             )
         else:
+            logger.error("NOVA agent: answer still missing evidence markers")
             return SAFE_FAILURE
-        return _finalize(text, excerpts, tracker.verified_urls, question)
 
-    async def _run_tool_loop(self, *, tracker: SourceTracker, **kwargs):
-        tools = kwargs.pop("tools", None)
-        if tools is None:
-            tools = self.tools(tracker)
-        max_steps = int(kwargs.pop("max_steps", 8))
-        if self._tool_loop is not None:
-            return await self._tool_loop(
-                tools=tools,
-                max_steps=max_steps,
-                tracker=tracker,
-                **kwargs,
+        return self._finalize_answer(
+            text,
+            excerpts,
+            tracker.verified_urls,
+            include_sources=include_sources,
+        )
+
+    def _build_answer_prompt(
+        self, question: str, excerpts: list[EvidenceExcerpt]
+    ) -> str:
+        parts = [f"请回答原问题：{question}\n"]
+        parts.append(
+            "你只能使用下面标记的证据回答问题。"
+            "若某条证据明确标记 no_answer，只能说明该事项暂无可靠资料，"
+            "不能用其他相邻材料推断；但不得因此忽略其他已有正面证据的问题部分。"
+        )
+        for excerpt in excerpts:
+            loc = ""
+            if excerpt.line_start is not None:
+                end = excerpt.line_end if excerpt.line_end is not None else excerpt.line_start
+                loc = f" 位置：第 {excerpt.line_start}—{end} 行"
+            note = ""
+            if excerpt.historical:
+                note = "（历史资料）"
+            if excerpt.qa_status == "no_answer":
+                note += "（该证据明确说明暂无可靠资料）"
+
+            version_meta: list[str] = []
+            if excerpt.version_status:
+                version_meta.append(f"版本状态：{excerpt.version_status}")
+            if excerpt.document_year is not None:
+                version_meta.append(f"文档年份：{excerpt.document_year}")
+            if excerpt.applicable_years:
+                version_meta.append(
+                    f"适用年份：{', '.join(str(y) for y in excerpt.applicable_years)}"
+                )
+            if excerpt.applicable_cohorts:
+                version_meta.append(
+                    f"适用年级：{', '.join(excerpt.applicable_cohorts)}"
+                )
+            if excerpt.historical_reason:
+                version_meta.append(f"判定原因：{excerpt.historical_reason}")
+            meta_part = ("\n".join(version_meta) + "\n") if version_meta else ""
+
+            header = (
+                f"[{excerpt.evidence_id}]\n"
+                f"来源：《{excerpt.title}》{loc}{note}\n"
+                f"URL：{excerpt.url or 'n/a'}\n"
+                f"{meta_part}内容：\n{excerpt.content}"
             )
+            parts.append(header)
+        return "\n\n".join(parts)
+
+    def _answer_tools(self, tracker: SourceTracker) -> list[object]:
+        """Return an empty tool set for the answer phase.
+
+        The answer model must only use the evidence selected during research.
+        Opening more tools here would allow new evidence that cannot be cited.
+        """
+        return []
+
+    def _finalize_answer(
+        self,
+        text: str,
+        excerpts: list[EvidenceExcerpt],
+        verified_urls: set[str] | None = None,
+        *,
+        include_sources: bool = True,
+    ) -> str:
+        used_ids = _extract_used_evidence_ids(text)
+        seen: set[str] = set()
+        used: list[EvidenceExcerpt] = []
+        for e in excerpts:
+            if e.evidence_id in used_ids and e.evidence_id not in seen:
+                seen.add(e.evidence_id)
+                used.append(e)
+        if not used and not _is_pure_no_evidence(text):
+            logger.warning("NOVA agent: no evidence markers in final answer")
+            return SAFE_FAILURE
+
+        # Strip internal markers from the visible answer.
+        visible = re.sub(r"\[E\d+]", "", text).strip()
+        if _is_pure_no_evidence(visible):
+            logger.info("NOVA agent: no-evidence answer, suppressing citations")
+            return visible or NO_EVIDENCE
+
+        # Remove any URLs the model hallucinated; keep URLs that appear in the
+        # evidence content or in the cited excerpts.
+        allowed_urls: set[str] = set()
+        if include_sources:
+            allowed_urls.update(verified_urls or set())
+            allowed_urls.update(e.url for e in used if e.url)
+        visible = _strip_unverified_urls(visible, allowed_urls)
+
+        citations = self._build_citations(used)
+        logger.info(
+            "NOVA agent: available=%d used=%d citations=%d",
+            len(excerpts),
+            len(used),
+            len(citations),
+        )
+        if self.diagnostics:
+            logger.info(
+                "NOVA agent final: available_ids=%s used_ids=%s citation_count=%d",
+                [e.evidence_id for e in excerpts],
+                used_ids,
+                len(citations),
+            )
+        if not include_sources or not citations:
+            return visible
+        return f"{visible}\n\n参考来源：\n" + "\n".join(citations)
+
+    def _build_citations(self, used: list[EvidenceExcerpt]) -> list[str]:
+        seen: set[str] = set()
+        citations: list[str] = []
+        for excerpt in sorted(used, key=lambda e: e.evidence_id):
+            key = excerpt.document_id or excerpt.url or excerpt.file_path
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            citations.append(f"{len(citations) + 1}. 《{excerpt.title}》：{excerpt.url or excerpt.file_path}")
+        return citations
+
+    def _log_evidence_summary(self, tracker: SourceTracker) -> None:
+        if not self.diagnostics:
+            return
+        logger.info("NOVA evidence summary: candidates=%d excerpts=%d read=%d",
+                    len(tracker.candidate_sources),
+                    len(tracker.evidence_excerpts),
+                    tracker.read_count)
+        for i, cand in enumerate(tracker.candidate_sources[:20], 1):
+            logger.info(
+                "NJU candidate %d: title=%s path=%s score=%s",
+                i,
+                getattr(cand.document, "title", "?"),
+                getattr(cand.document, "path", "?"),
+                cand.score,
+            )
+        for e in tracker.evidence_excerpts:
+            logger.info(
+                "NOVA evidence excerpt: id=%s type=%s doc=%s lines=%s:%s chars=%d "
+                "qa=%s historical=%s years=%s cohorts=%s doc_year=%s version=%s reason=%s",
+                e.evidence_id,
+                e.evidence_type,
+                e.document_id,
+                e.line_start,
+                e.line_end,
+                len(e.content),
+                e.qa_status,
+                e.historical,
+                e.applicable_years,
+                e.applicable_cohorts,
+                e.document_year,
+                e.version_status,
+                e.historical_reason,
+            )
+
+    async def _run_tool_loop(
+        self, *, tracker: SourceTracker, **kwargs: object
+    ) -> object:
+        # Allow callers to override the tool set (e.g. answer phase).
+        if "tools" not in kwargs:
+            kwargs["tools"] = self.tools(tracker)
+        max_steps = int(kwargs.pop("max_steps", 12))
+
+        if self._tool_loop is not None:
+            return await self._tool_loop(max_steps=max_steps, **kwargs)
+
         from astrbot.core.agent.tool import ToolSet
 
+        # The real AstrBot tool loop does not accept our internal tracker; it is
+        # passed to the tools factory above.
+        kwargs.pop("tracker", None)
         return await self.context.tool_loop_agent(
-            tools=ToolSet(tools),
+            tools=ToolSet(kwargs.pop("tools")),
             max_steps=max_steps,
             tool_call_timeout=60,
             **kwargs,
         )
 
-
-def _build_grounded_prompt(
-    question: str,
-    excerpts: list[EvidenceExcerpt],
-) -> str:
-    parts = [f"请回答原问题：{question}"]
-    for excerpt in excerpts:
-        location = ""
-        if excerpt.line_start is not None:
-            location = f"第 {excerpt.line_start}—{excerpt.line_end or excerpt.line_start} 行"
-        parts.append(
-            f"[{excerpt.evidence_id}]\n"
-            f"标题：{excerpt.title}\n"
-            f"文件：{excerpt.file_path} {location}\n"
-            f"原文：{excerpt.url or 'n/a'}\n"
-            f"版本状态：{excerpt.version_status}\n"
-            f"内容：\n{excerpt.content}"
-        )
-    return "\n\n".join(parts)
-
-
-def _finalize(
-    text: str,
-    excerpts: list[EvidenceExcerpt],
-    verified_urls: set[str],
-    question: str,
-) -> str:
-    used_ids = _extract_evidence_ids(text)
-    if not used_ids:
-        return NO_EVIDENCE if _is_no_evidence(text) else SAFE_FAILURE
-    known_ids = {excerpt.evidence_id for excerpt in excerpts}
-    if any(evidence_id not in known_ids for evidence_id in used_ids):
-        return SAFE_FAILURE
-    if not _all_claims_grounded(text, excerpts):
-        return SAFE_FAILURE
-    used = [excerpt for excerpt in excerpts if excerpt.evidence_id in used_ids]
-    if not used and not _is_no_evidence(text):
-        return SAFE_FAILURE
-    visible = re.sub(r"\[E\d+]", "", text).strip()
-    allowed_urls = set(verified_urls)
-    allowed_urls.update(excerpt.url for excerpt in used if excerpt.url)
-    visible = _strip_unverified_urls(visible, allowed_urls)
-    if not _asks_for_sources(question) or not used:
-        return visible
-    citations = []
-    seen: set[str] = set()
-    for excerpt in used:
-        key = excerpt.document_id or excerpt.file_path
-        if key in seen:
-            continue
-        seen.add(key)
-        citations.append(
-            f"{len(citations) + 1}. 《{excerpt.title}》：{excerpt.url or excerpt.file_path}"
-        )
-    return visible + ("\n\n来源：\n" + "\n".join(citations) if citations else "")
+    def _read_source_body(self, source: SearchResult, limit: int = 8000) -> str:
+        """Return full document body when docs_root is configured, else chunk snippet."""
+        if self.docs_root is None or source.document.path is None:
+            return (
+                source.chunk.content_snippet[:limit]
+                if source.chunk
+                else source.document.body[:limit]
+            )
+        try:
+            result = read_document_content(
+                self.docs_root, str(source.document.path), offset=0, limit=limit
+            )
+            return result["content"]
+        except ValueError:
+            return (
+                source.chunk.content_snippet[:limit]
+                if source.chunk
+                else source.document.body[:limit]
+            )
 
 
-def _extract_evidence_ids(text: str) -> list[str]:
-    return list(dict.fromkeys(re.findall(r"\[(E\d+)]", text)))
-
-
-def _all_claims_grounded(text: str, excerpts: list[EvidenceExcerpt]) -> bool:
-    known_ids = {excerpt.evidence_id for excerpt in excerpts}
-    clauses = re.findall(r"[^。！？!?\n]+[。！？!?]?(?:\s*\[E\d+])?", text)
-    substantive = [clause for clause in clauses if re.search(r"[\w一-鿿]{2}", clause)]
-    return bool(substantive) and all(
-        (ids := _extract_evidence_ids(clause))
-        and all(evidence_id in known_ids for evidence_id in ids)
-        for clause in substantive
-    )
-
-
-def _is_no_evidence(text: str) -> bool:
-    return any(phrase in text for phrase in ("没有明确", "没有找到", "证据不足", "资料不足"))
-
-
-def _asks_for_sources(question: str) -> bool:
-    return any(word in question.casefold() for word in ("来源", "出处", "原文", "链接"))
-
-
-def _strip_unverified_urls(text: str, allowed_urls: set[str]) -> str:
-    return re.sub(
-        r"https?://[^\s<>()，。；：\"']+",
-        lambda match: match.group(0) if match.group(0) in allowed_urls else "",
-        text,
-    )
-
-
-def _is_small_talk(prompt: str) -> bool:
-    normalized = re.sub(r"[^\w一-鿿]", "", prompt).casefold()
-    return normalized in {
-        "你好",
-        "在吗",
-        "你是谁",
-        "谢谢",
-        "谢谢你",
-        "hello",
-        "hi",
-    }
+# Public NOVA-facing name; the implementation remains the source-level port.
+NovaCacAgent = NjuQaAgent

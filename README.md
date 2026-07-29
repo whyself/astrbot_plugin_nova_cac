@@ -48,7 +48,7 @@ AstrBot 不会因为模型“觉得自己忘了”就自动发现或读取插件
 git clone https://github.com/whyself/astrbot_plugin_nova_cac.git
 ```
 
-随后在 AstrBot 管理面板中重载或重启插件，并确保已配置可用的聊天模型提供商。若要启用向量检索，还需在 AstrBot 中配置 Embedding Provider；没有嵌入提供商时，插件会自动退化为关键词检索，仍可回答。
+随后在 AstrBot 管理面板中重载或重启插件，并确保已配置可用的聊天模型提供商。若要启用向量检索，还需像参考插件一样配置 OpenAI-compatible Embedding API；未配置时，插件会自动退化为关键词检索，仍可回答。
 
 插件通过 `requirements.txt` 安装 ChromaDB，用来保存本地向量索引。
 
@@ -58,8 +58,9 @@ git clone https://github.com/whyself/astrbot_plugin_nova_cac.git
 
 - `search_knowledge_base`：融合 Chroma 向量相似度与 BM25 关键词得分，返回候选片段；
 - `grep_local_docs`：按明确的名称、日期、条款或关键词定位 Markdown 行；
-- `list_docs`、`get_doc_outline`：浏览文章和标题结构；
 - `read_doc`：读取指定文章的准确行段，并把它登记为可用于回答的证据。
+- `search_docs`、`get_doc_details`、`parse_yuque_url`：按文档元数据、路径或原始语雀链接定位资料；
+- `list_knowledge_bases`、`list_repo_docs`、`list_repo_tree`、`get_doc_outline`、`doc_stats`：浏览完整知识结构和索引状态。
 
 搜索结果只是候选，不能直接进入最终回答。研究 Agent 必须再用 `read_doc` 读到正文；随后回答阶段关闭全部工具，只接收已登记的原文证据。内部证据标记在输出前会校验并移除。用户没有主动问“来源、出处、原文、链接”时，最终回答仍保持自然口语，不展示检索报告或引用列表。
 
@@ -73,12 +74,16 @@ git clone https://github.com/whyself/astrbot_plugin_nova_cac.git
 | `max_sessions` | `256` | 内存中最多保留的会话数 |
 | `history_max_chars` | `12000` | 每个会话的近期问答总字符上限 |
 | `retrieval_top_k` | `5` | 混合检索每次返回给研究 Agent 的候选片段上限 |
-| `score_threshold` | `0.2` | 混合检索最低相关度，范围为 `0`—`1` |
-| `embedding_provider_id` | 空 | 指定 AstrBot Embedding Provider；留空时使用第一个可用提供商 |
+| `score_threshold` | `0.25` | 混合检索最低相关度，范围为 `0`—`1` |
+| `embedding_api_key` | 空 | OpenAI-compatible Embedding API Key |
+| `embedding_base_url` | 空 | Embedding API 根地址；插件会请求其 `/embeddings` 接口 |
+| `embedding_model` | `text-embedding-3-small` | Embedding 模型名称 |
 | `enable_vector_search` | `true` | 是否启用 Chroma 向量检索 |
 | `chunk_size` | `1200` | Markdown 分块的目标字符数 |
 | `chunk_overlap` | `180` | 超长块滑动切分时的重叠字符数 |
 | `retrieval_diagnostics` | `false` | 是否在日志中输出检索与证据诊断摘要 |
+
+从 `v0.2.x` 升级时，旧的 `embedding_provider_id` 不再使用；请改填与参考插件相同的 `embedding_api_key`、`embedding_base_url` 和 `embedding_model`。
 
 轮数上限和字符上限同时生效，任意一个达到上限都会淘汰最早的完整问答轮次。只有成功触发并完成回答的 `/cac` 问答会被写入；普通消息、其他插件消息和失败的模型调用都不会进入上下文。
 
@@ -113,12 +118,12 @@ knowledge_pack/
 ## 开发与验证
 
 ```bash
-python -m unittest discover -s tests -v
+pytest -q
 python -m compileall -q main.py nova_cac tests
 ruff check .
 ```
 
-实现参考了 AstrBot 官方插件接口、[Soulter/helloworld](https://github.com/Soulter/helloworld) 模板，并复用了 [Gu-Heping/astrbot_plugin_nju_qa](https://github.com/Gu-Heping/astrbot_plugin_nju_qa) 的两阶段证据 Agent、混合检索和工具化阅读思路；NJU 的远程语雀同步被替换为当前仓库内的本地 Markdown 内容包。
+实现使用 AstrBot 官方插件接口和 [Soulter/helloworld](https://github.com/Soulter/helloworld) 模板，并以源码级方式移植 [Gu-Heping/astrbot_plugin_nju_qa](https://github.com/Gu-Heping/astrbot_plugin_nju_qa) 提交 `275d8b8d` 的两阶段 Agent、证据系统、混合检索、文档索引和完整研究工具；唯一的数据源替换是把远程语雀同步改成本仓库的 Markdown 内容包。完整移植清单和保留的 NOVA 适配边界见 [`REFERENCE_PORT.md`](REFERENCE_PORT.md)。
 
 ## 许可证
 

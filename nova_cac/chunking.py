@@ -181,19 +181,17 @@ def split_markdown(
         if len(block) > size:
             # Long block gets its own sliding split.
             flush_current()
+            step = max(1, size - overlap)
             start = 0
             while start < len(block):
                 end = _boundary_cut(block[start:], size) + start
                 piece = block[start:end].strip()
                 if piece:
                     parts.append(piece)
-                if end >= len(block):
-                    break
-                # Advance from the actual soft cut so text between an early
-                # punctuation boundary and the target size is never skipped.
-                next_start = max(start + 1, end - overlap)
+                # Advance by step; ensure progress even if overlap is large.
+                next_start = min(len(block), start + step)
                 if next_start <= start:
-                    next_start = start + 1
+                    next_start = start + step
                 start = next_start
             continue
 
