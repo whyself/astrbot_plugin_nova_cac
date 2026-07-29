@@ -343,3 +343,35 @@ def test_nova_style_gate_keeps_list_when_question_explicitly_requests_one():
 
     assert calls == 1
     assert "- 文档评议" in answer
+
+
+def test_nova_style_gate_retries_generic_ai_explainer_tone():
+    generic_draft = """NOVA 是南京大学的一个学生社团。
+
+但要说它是什么样的社团，可能得先澄清一个常见的误解。NOVA 更关心的是另一组能力：
+你能不能发现真实问题？能不能判断信息是否可靠？能不能把想法变成可协作的东西？
+技术只是实现这些的手段。"""
+    calls = 0
+
+    async def loop(**_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            return Response(generic_draft)
+        return Response(
+            "会做技术，而且做得还不少。但把 NOVA 叫成技术社团，"
+            "有点像把大学叫成“上课的地方”——不能说错，就是漏了最重要的那一截。\n\n"
+            "说人话就是，代码和 AI 都只是工具。NOVA 更想让人从一个真问题出发，"
+            "自己补知识、找人合作，再把那个还很模糊的想法慢慢做出来。"
+        )
+
+    agent = NovaCacAgent(Context(), lambda tracker: [], loop)
+    answer = asyncio.run(
+        agent.answer(Event(), "NOVA 是什么？", base_system_prompt="PACK")
+    )
+
+    assert calls == 3
+    assert "澄清一个常见的误解" not in answer
+    assert answer.count("能不能") == 0
+    assert "有点像把大学叫成" in answer
+    assert "说人话就是" in answer

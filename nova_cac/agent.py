@@ -135,11 +135,32 @@ def _needs_style_rewrite(prompt: str, text: str) -> bool:
         "一个关键张力",
         "从几个层面说",
     )
+    generic_explainer_phrases = (
+        "澄清一个常见的误解",
+        "更关心的是另一组能力",
+        "技术只是实现这些的手段",
+        "可以从以下几个方面",
+        "主要体现在以下",
+    )
     report_like = any(phrase in text for phrase in report_phrases)
+    generic_explainer = any(
+        phrase in text for phrase in generic_explainer_phrases
+    ) or text.count("能不能") >= 3
     if _is_simple_query(prompt):
         unnecessary_list = bullet_count >= 2 and not _query_wants_structure(prompt)
-        return heading_count > 0 or unnecessary_list or len(text) > 520 or report_like
-    return heading_count >= 2 or (heading_count > 0 and bullet_count >= 3) or report_like
+        return (
+            heading_count > 0
+            or unnecessary_list
+            or len(text) > 520
+            or report_like
+            or generic_explainer
+        )
+    return (
+        heading_count >= 2
+        or (heading_count > 0 and bullet_count >= 3)
+        or report_like
+        or generic_explainer
+    )
 
 
 def _enforce_conversational_shape(prompt: str, text: str) -> str:
@@ -866,7 +887,10 @@ grep 缩小范围，再按需浏览目录、读取原文；资料足够后直接
 答案时，按照内容包中的事实边界自然说明不确定之处，不要套用固定拒答句。普通交流可以
 直接回应，不需要为了调用工具而调用工具。简单问题默认不分标题，非必要不用列表；
 不要试图在一次回答中把整个主题说清楚，只展开当前问题需要的部分，能用两三段说清楚
-就及时收住。最终回答必须自然、口语化，不附参考来源、文档路径、原文链接或引用编号。"""
+就及时收住。表达不能只是“定义—澄清误解—抽象能力”的通用讲解模板：先给一个真实
+判断，再用自然转折把问题往下拧一层；必要时用一个生活化类比或“说人话”的解释，但
+不要连续堆三个反问。最终回答必须自然、口语化，不附参考来源、文档路径、原文链接或
+引用编号。"""
 
 _STYLE_REWRITE_SYSTEM_PROMPT = """你只负责把已有回答改成 CAC 式的自然聊天表达。
 
@@ -878,6 +902,10 @@ _STYLE_REWRITE_SYSTEM_PROMPT = """你只负责把已有回答改成 CAC 式的�
   否则不使用列表；简单定义问题禁止列清单。
 - 使用两到三个自然短段落，像在群聊里认真解释，不像社团介绍、百科或汇报材料。
 - 少堆抽象名词，能用普通说法就不用“核心定位、关键特点、能力培养、组织方式”等套话。
+- 不套用“先定义—再澄清误解—最后罗列能力”的标准解释模板。先说一个有立场的判断，
+  再通过“但问题在于”“说人话就是”或一个贴近日常的类比把判断讲透。
+- 允许一点自然的停顿、自我修正或轻微调侃，不要把每句话都打磨成宣传稿。
+- 最多使用一个真正有推进作用的反问，不连续排列“能不能……能不能……”。
 - 不要试图一次把整个主题讲完；简单问题控制在大约 350 个汉字以内。
 - 不以“如果你还想了解……可以继续问”这类客服式追问收尾。
 - 不输出来源、文档名、路径、链接或引用编号。"""
@@ -946,25 +974,40 @@ class NovaCacAgent(NjuQaAgent):
         draft: str,
         base_system_prompt: str,
     ) -> str:
-        rewrite_prompt = (
-            f"<原问题>\n{question}\n</原问题>\n\n"
-            f"<待改写回答>\n{draft}\n</待改写回答>"
-        )
-        try:
-            response = await self._run_tool_loop(
-                event=event,
-                chat_provider_id=provider_id,
-                prompt=rewrite_prompt,
-                system_prompt=(
-                    f"{base_system_prompt}\n\n{_STYLE_REWRITE_SYSTEM_PROMPT}"
-                ),
-                contexts=[],
-                tracker=SourceTracker(),
-                tools=[],
-                max_steps=1,
+        current = draft
+        for attempt in range(2):
+            retry_note = (
+                "\n\n上一版仍然像通用 AI 讲解稿。进一步减少抽象概念和排比，"
+                "加入真实判断与自然转折，重新改写。"
+                if attempt
+                else ""
             )
-        except Exception:
-            logger.exception("NOVA CAC style rewrite failed")
-            return _enforce_conversational_shape(question, draft)
-        rewritten = str(getattr(response, "completion_text", "") or "").strip()
-        return rewritten or _enforce_conversational_shape(question, draft)
+            rewrite_prompt = (
+                f"<原问题>\n{question}\n</原问题>\n\n"
+                f"<待改写回答>\n{current}\n</待改写回答>{retry_note}"
+            )
+            try:
+                response = await self._run_tool_loop(
+                    event=event,
+                    chat_provider_id=provider_id,
+                    prompt=rewrite_prompt,
+                    system_prompt=(
+                        f"{base_system_prompt}\n\n{_STYLE_REWRITE_SYSTEM_PROMPT}"
+                    ),
+                    contexts=[],
+                    tracker=SourceTracker(),
+                    tools=[],
+                    max_steps=1,
+                )
+            except Exception:
+                logger.exception("NOVA CAC style rewrite failed")
+                return _enforce_conversational_shape(question, current)
+            rewritten = str(getattr(response, "completion_text", "") or "").strip()
+            if not rewritten:
+                continue
+            current = _strip_source_appendix(
+                _strip_unverified_urls(rewritten, set())
+            )
+            if not _needs_style_rewrite(question, current):
+                return current
+        return _enforce_conversational_shape(question, current)
