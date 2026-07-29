@@ -15,13 +15,38 @@
     "default": 12000
   },
   "retrieval_top_k": {
-    "description": "每次最多送给模型的知识片段数",
+    "description": "混合检索每次最多返回给研究 Agent 的候选片段数",
     "type": "int",
     "default": 5
   },
-  "max_context_chars": {
-    "description": "检索知识片段的总字符上限，不包含四个必读文件",
+  "score_threshold": {
+    "description": "向量与关键词混合检索的最低相关度，范围 0-1",
+    "type": "float",
+    "default": 0.2
+  },
+  "embedding_provider_id": {
+    "description": "AstrBot Embedding Provider ID；留空时使用第一个可用的嵌入提供商",
+    "type": "string",
+    "default": ""
+  },
+  "enable_vector_search": {
+    "description": "启用 Chroma 向量检索；无可用 Embedding Provider 时自动退化为关键词检索",
+    "type": "bool",
+    "default": true
+  },
+  "chunk_size": {
+    "description": "Markdown 分块目标字符数",
     "type": "int",
-    "default": 9000
+    "default": 1200
+  },
+  "chunk_overlap": {
+    "description": "超长 Markdown 块滑动切分时的重叠字符数",
+    "type": "int",
+    "default": 180
+  },
+  "retrieval_diagnostics": {
+    "description": "在 AstrBot 日志中输出 Agent 检索与证据诊断摘要",
+    "type": "bool",
+    "default": false
   }
 }

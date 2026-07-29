@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from nova_cac.core import ConversationMemory, KnowledgeIndex, PackLoader
+from nova_cac.core import ConversationMemory, PackLoader
 
 
 class PackLoaderTests(unittest.TestCase):
@@ -24,50 +24,6 @@ class PackLoaderTests(unittest.TestCase):
             self.assertNotIn("soul.md:v1", second)
             for name in PackLoader.CORE_FILES:
                 self.assertIn(f"文件：{name}", second)
-
-
-class KnowledgeIndexTests(unittest.TestCase):
-    def test_retrieval_prefers_current_rules_for_membership_question(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir) / "knowledge"
-            current_dir = root / "03_规章与活动"
-            history_dir = root / "01_认识NOVA"
-            current_dir.mkdir(parents=True)
-            history_dir.mkdir(parents=True)
-            (current_dir / "NOVA管理章程（2026版）.md").write_text(
-                "---\n"
-                'title: "NOVA管理章程（2026版）"\n'
-                'updated_at: "2026-07-23"\n'
-                "---\n"
-                "# 章程\n\n"
-                "无论是否具备技术基础，只要认同共同价值观，NOVA欢迎本科学生加入。",
-                encoding="utf-8",
-            )
-            (history_dir / "旧活动记录.md").write_text(
-                "# 旧活动记录\n\n曾经讨论过加入流程与技术基础。",
-                encoding="utf-8",
-            )
-
-            results = KnowledgeIndex(root).search(
-                "没有技术基础能加入 NOVA 吗？",
-                top_k=2,
-                max_chars=4000,
-            )
-
-            self.assertTrue(results)
-            self.assertEqual("NOVA管理章程（2026版）", results[0].title)
-            self.assertIn("欢迎本科学生加入", results[0].content)
-
-    def test_embedded_fall_activity_query_prefers_current_plan(self) -> None:
-        pack_root = Path(__file__).resolve().parents[1] / "knowledge_pack"
-        results = KnowledgeIndex(pack_root / "knowledge").search(
-            "2026 秋季有哪些活动？",
-            top_k=3,
-            max_chars=5000,
-        )
-
-        self.assertTrue(results)
-        self.assertEqual("NOVA-2026秋活动方案", results[0].title)
 
 
 class ConversationMemoryTests(unittest.TestCase):

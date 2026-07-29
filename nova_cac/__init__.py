@@ -1,11 +1,14 @@
-"""Framework-independent core for the NOVA CAC AstrBot plugin."""
+"""NOVA CAC knowledge Pack and evidence-first local RAG."""
 
-from .core import ConversationMemory, KnowledgeIndex, PackLoader, RetrievedChunk
+from .agent import NovaCacAgent
+from .core import ConversationMemory, PackLoader
+from .local_corpus import LocalCorpus
+from .retriever import HybridRetriever
 
 __all__ = [
     "ConversationMemory",
-    "KnowledgeIndex",
+    "HybridRetriever",
+    "LocalCorpus",
+    "NovaCacAgent",
     "PackLoader",
-    "RetrievedChunk",
 ]
-

@@ -1,2 +1,1 @@
-# No third-party runtime dependencies.
-
+chromadb>=0.4,<0.6

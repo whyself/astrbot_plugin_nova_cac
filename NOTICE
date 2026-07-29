@@ -1,0 +1,15 @@
+astrbot_plugin_nova_cac
+Copyright (C) 2026 whyself
+
+Version 0.2.0 incorporates and adapts implementation ideas and source code
+from astrbot_plugin_nju_qa:
+https://github.com/Gu-Heping/astrbot_plugin_nju_qa
+
+astrbot_plugin_nju_qa is distributed under the GNU Affero General Public
+License version 3. The combined and modified work is therefore distributed
+under the same license. See LICENSE.
+
+The Markdown documents under knowledge_pack/ are source materials collected
+for this project. They are not relicensed under AGPL-3.0 by this software
+license; their copyrights and original source terms remain with their
+respective authors.

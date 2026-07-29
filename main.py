@@ -9,17 +9,35 @@ from typing import Any
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star, StarTools, register
 
-from .nova_cac.core import ConversationMemory, KnowledgeIndex, PackLoader
+from .nova_cac.agent import (
+    AGENT_ERROR,
+    NO_EVIDENCE,
+    NO_PROVIDER,
+    SAFE_FAILURE,
+    NovaCacAgent,
+)
+from .nova_cac.chunk_store import ChunkStore
+from .nova_cac.core import ConversationMemory, PackLoader
+from .nova_cac.local_corpus import LocalCorpus
+from .nova_cac.retriever import HybridRetriever
 from .nova_cac.routing import extract_cac_query
+from .nova_cac.tools import (
+    GetDocOutlineTool,
+    GrepLocalDocsTool,
+    ListDocsTool,
+    ReadDocTool,
+    SearchKnowledgeBaseTool,
+)
+from .nova_cac.vector_index import ChunkVectorIndex
 
 
 @register(
     "astrbot_plugin_nova_cac",
     "whyself",
     "基于本地 NOVA 知识包与近期上下文的 CAC 风格问答",
-    "0.1.0",
+    "0.2.0",
 )
 class NovaCacPlugin(Star):
     """Explicitly triggered `/cac` knowledge Q&A."""
@@ -31,7 +49,6 @@ class NovaCacPlugin(Star):
 
         pack_root = Path(__file__).resolve().parent / "knowledge_pack"
         self.pack_loader = PackLoader(pack_root)
-        self.knowledge_index = KnowledgeIndex(pack_root / "knowledge")
         self.memory = ConversationMemory(
             history_turns=self._config_int("history_turns", 6, minimum=0, maximum=20),
             max_sessions=self._config_int(
@@ -47,21 +64,106 @@ class NovaCacPlugin(Star):
                 maximum=50000,
             ),
         )
-        self.retrieval_top_k = self._config_int(
+        retrieval_top_k = self._config_int(
             "retrieval_top_k",
             5,
             minimum=1,
             maximum=12,
         )
-        self.max_context_chars = self._config_int(
-            "max_context_chars",
-            9000,
-            minimum=1000,
-            maximum=30000,
+        score_threshold = self._config_float(
+            "score_threshold",
+            0.2,
+            minimum=0.0,
+            maximum=1.0,
+        )
+
+        data_dir = StarTools.get_data_dir("astrbot_plugin_nova_cac")
+        self._data_dir = data_dir
+        self.chunk_store = ChunkStore(data_dir / "chunks.sqlite3")
+        embedding_provider = self._resolve_embedding_provider()
+        embedding_key = self._embedding_key(embedding_provider)
+        vector_enabled = self._config_bool("enable_vector_search", True)
+        vector_index = None
+        embed_one = None
+        embed_many = None
+        if vector_enabled and embedding_provider is not None:
+            dimension = self._embedding_dimension(embedding_provider)
+            vector_index = ChunkVectorIndex(
+                data_dir / "vectors",
+                model=embedding_key,
+                embedding_dimension=dimension,
+            )
+            embed_one = embedding_provider.get_embedding
+            embed_many = self._batch_embedder(embedding_provider)
+        elif vector_enabled:
+            logger.warning(
+                "NOVA CAC vector search disabled at runtime: "
+                "no AstrBot Embedding Provider is available"
+            )
+
+        chunk_size = self._config_int(
+            "chunk_size",
+            1200,
+            minimum=200,
+            maximum=8000,
+        )
+        configured_overlap = self._config_int(
+            "chunk_overlap",
+            180,
+            minimum=0,
+            maximum=1000,
+        )
+        chunk_overlap = min(configured_overlap, max(0, chunk_size // 2 - 1))
+        self.corpus = LocalCorpus(
+            pack_root / "knowledge",
+            self.chunk_store,
+            vector_index=vector_index,
+            embed_many=embed_many,
+            embedding_key=embedding_key,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+        )
+        self.retriever = HybridRetriever(
+            self.corpus,
+            self.chunk_store,
+            vector_index=vector_index,
+            embed_one=embed_one,
+            top_k=retrieval_top_k,
+            score_threshold=score_threshold,
+        )
+        diagnostics = self._config_bool("retrieval_diagnostics", False)
+        self.agent = NovaCacAgent(
+            self.context,
+            lambda tracker: [
+                SearchKnowledgeBaseTool(
+                    retriever=self.retriever,
+                    tracker=tracker,
+                ),
+                GrepLocalDocsTool(corpus=self.corpus),
+                ReadDocTool(corpus=self.corpus, tracker=tracker),
+                ListDocsTool(corpus=self.corpus),
+                GetDocOutlineTool(corpus=self.corpus),
+            ],
+            diagnostics=diagnostics,
         )
         self._session_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
             weakref.WeakValueDictionary()
         )
+
+    async def initialize(self) -> None:
+        result = await self.corpus.refresh()
+        logger.info(
+            "NOVA CAC local corpus: documents=%s chunks=%s rebuilt=%s vector_ready=%s",
+            result.get("documents"),
+            result.get("chunks"),
+            result.get("rebuilt"),
+            result.get("vector_ready"),
+        )
+        if result.get("vector_error"):
+            logger.warning("NOVA CAC vector index fallback: %s", result["vector_error"])
+
+    async def terminate(self) -> None:
+        self.corpus.close()
 
     @filter.regex(r"^/?cac(?:\s+.*)?$")
     async def cac(self, event: AstrMessageEvent):
@@ -91,30 +193,26 @@ class NovaCacPlugin(Star):
 
         async with self._session_lock(session_key):
             try:
-                provider_id = await self.context.get_current_chat_provider_id(
-                    event.unified_msg_origin
+                system_prompt = await asyncio.to_thread(
+                    self.pack_loader.build_system_prompt
                 )
-                if not provider_id:
-                    yield event.plain_result("当前没有可用的聊天模型，请先在 AstrBot 中配置提供商。")
-                    return
-
-                system_prompt, user_prompt = await asyncio.to_thread(
-                    self._prepare_prompts,
+                answer = await self.agent.answer(
+                    event,
                     query,
-                )
-                response = await self.context.llm_generate(
-                    chat_provider_id=provider_id,
-                    prompt=user_prompt,
-                    system_prompt=system_prompt,
+                    base_system_prompt=system_prompt,
                     contexts=self.memory.contexts(session_key),
                 )
-                answer = str(getattr(response, "completion_text", "") or "").strip()
                 if not answer:
-                    logger.warning("NOVA CAC provider returned an empty response")
-                    yield event.plain_result("这次模型没有生成有效回答，可以换个说法再问一次。")
+                    yield event.plain_result(AGENT_ERROR)
                     return
 
-                self.memory.append_exchange(session_key, query, answer)
+                if answer not in {
+                    AGENT_ERROR,
+                    NO_EVIDENCE,
+                    NO_PROVIDER,
+                    SAFE_FAILURE,
+                }:
+                    self.memory.append_exchange(session_key, query, answer)
                 yield event.plain_result(answer)
             except FileNotFoundError:
                 logger.exception("NOVA CAC mandatory knowledge-pack file is missing")
@@ -122,21 +220,6 @@ class NovaCacPlugin(Star):
             except Exception:
                 logger.exception("NOVA CAC answer generation failed")
                 yield event.plain_result("这次回答没有生成成功，请稍后再试。")
-
-    def _prepare_prompts(self, question: str) -> tuple[str, str]:
-        # build_system_prompt intentionally rereads all four files on every call.
-        system_prompt = self.pack_loader.build_system_prompt()
-        chunks = self.knowledge_index.search(
-            question,
-            top_k=self.retrieval_top_k,
-            max_chars=self.max_context_chars,
-        )
-        logger.info(
-            "NOVA CAC retrieval selected %d chunks for query length %d",
-            len(chunks),
-            len(question),
-        )
-        return system_prompt, self.pack_loader.build_user_prompt(question, chunks)
 
     def _config_int(
         self,
@@ -153,6 +236,87 @@ class NovaCacPlugin(Star):
         except (TypeError, ValueError):
             value = default
         return min(maximum, max(minimum, value))
+
+    def _config_float(
+        self,
+        key: str,
+        default: float,
+        *,
+        minimum: float,
+        maximum: float,
+    ) -> float:
+        getter = getattr(self.config, "get", None)
+        raw: Any = getter(key, default) if callable(getter) else default
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            value = default
+        return min(maximum, max(minimum, value))
+
+    def _config_bool(self, key: str, default: bool) -> bool:
+        getter = getattr(self.config, "get", None)
+        raw: Any = getter(key, default) if callable(getter) else default
+        if isinstance(raw, str):
+            return raw.casefold() in {"1", "true", "yes", "on"}
+        return bool(raw)
+
+    def _config_str(self, key: str, default: str = "") -> str:
+        getter = getattr(self.config, "get", None)
+        raw: Any = getter(key, default) if callable(getter) else default
+        return str(raw or default).strip()
+
+    def _resolve_embedding_provider(self):
+        provider_id = self._config_str("embedding_provider_id")
+        if provider_id:
+            provider = self.context.get_provider_by_id(provider_id)
+            if provider is not None and hasattr(provider, "get_embedding"):
+                return provider
+            logger.warning(
+                "NOVA CAC configured Embedding Provider was not found: %s",
+                provider_id,
+            )
+            return None
+        providers = self.context.get_all_embedding_providers()
+        return providers[0] if providers else None
+
+    def _embedding_key(self, provider) -> str:
+        if provider is None:
+            return ""
+        configured = self._config_str("embedding_provider_id")
+        provider_config = getattr(provider, "provider_config", {}) or {}
+        provider_id = (
+            configured
+            or str(provider_config.get("id", ""))
+            or type(provider).__name__
+        )
+        model = str(
+            provider_config.get("model", "")
+            or provider_config.get("model_name", "")
+            or type(provider).__name__
+        )
+        dimension = self._embedding_dimension(provider) or "unknown"
+        return f"provider={provider_id}|model={model}|dimension={dimension}"
+
+    @staticmethod
+    def _embedding_dimension(provider) -> int | None:
+        getter = getattr(provider, "get_dim", None)
+        if not callable(getter):
+            return None
+        try:
+            dimension = int(getter())
+            return dimension if dimension > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _batch_embedder(provider):
+        async def embed_many(texts: list[str]) -> list[list[float]]:
+            vectors: list[list[float]] = []
+            for start in range(0, len(texts), 32):
+                vectors.extend(await provider.get_embeddings(texts[start : start + 32]))
+            return vectors
+
+        return embed_many
 
     def _session_lock(self, session_key: str) -> asyncio.Lock:
         lock = self._session_locks.get(session_key)
